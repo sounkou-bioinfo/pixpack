@@ -1,12 +1,18 @@
 // main.rs
-// pixpack — encode arbitrary file -> viewable PNG (custom ancillary chunk), or
-// decode such a PNG -> original file, with *active proofs* of integrity.
-// One arg only: if path is PNG (by signature), decode; otherwise encode.
+// pixpack — visual encoding using tiled QR codes.
 //
-// Integrity proofs:
-// - Header (magic, version, original filename, original length, blake3) serialized via postcard
-// - On encode: after writing PNG, re-open, parse chunk, verify hash/length, exact bytes match
-// - On decode: verify hash/length, write output, re-hash output
+// Single-arg CLI:
+//   - If the given path decodes as a pixpack image (any common format): DECODE to the original file.
+//   - Otherwise: ENCODE the file into a *viewable* PNG made of QR codes.
+// Every step includes *active proofs* (BLAKE3, length, and a post-write re-decode).
+//
+// Integrity framing per-QR:
+//   magic:   b"PXP1"
+//   kind:    0x01=Header | 0x02=Chunk
+//   body:    postcard-serialized struct (VisualHeader/VisualChunk)
+//
+// VisualHeader { version, filename, total_len, file_hash, chunk_size, num_chunks }
+// VisualChunk  { version, index, chunk_hash, data }
 //
 // Build: cargo build --release
 // Run:   cargo run --release -- <path>
@@ -21,22 +27,26 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use blake3::Hasher;
-use image::{DynamicImage, GenericImage, Rgba};
-use png_achunk as achunk;
+use image::{imageops, DynamicImage, GrayImage, ImageBuffer, Rgba, RgbaImage};
+use qrcode::{types::Color, EcLevel, QrCode};
+use quircs::Quirc;
 use serde::{Deserialize, Serialize};
 
-// -------------------- constants & types --------------------
+// -------------------- Constants & types --------------------
 
-const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
-const CHUNK_NAME: &str = "ruSt"; // ancillary/private/reserved/safe-to-copy
-const MAGIC: &[u8; 8] = b"PNGPACK!";
+const MAGIC: &[u8; 4] = b"PXP1";
 const VERSION: u16 = 1;
 
-/// Bytes that haven't been verified yet.
+// Visual/layout parameters
+const DEFAULT_CHUNK_SIZE: usize = 800;   // baseline; auto-tuned down if QR size too big
+const MAX_MODULES_PER_QR: usize = 85;    // cap modules per side to stay readable/robust
+const MODULE_PX: u32 = 10;               // pixels per module for each QR when rendered
+const TILE_MARGIN_PX: u32 = 20;          // white padding around each QR tile
+const GRID_GAP_PX: u32 = 20;             // spacing between tiles
+const HEADER_REPLICATION: usize = 3;     // repeat header QR for robustness
+
 #[derive(Debug, Clone)]
 struct UnverifiedBytes(Vec<u8>);
-
-/// Bytes verified for exact length and BLAKE3 hash.
 #[derive(Debug, Clone)]
 struct VerifiedBytes(Vec<u8>);
 impl VerifiedBytes {
@@ -45,36 +55,35 @@ impl VerifiedBytes {
     }
 }
 
-/// Header stored before data inside the ancillary chunk.
-#[derive(Debug, Serialize, Deserialize)]
-struct PayloadHeader {
-    magic: [u8; 8],
+// Frames carried in QR codes
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct VisualHeader {
     version: u16,
-    orig_filename: String,
-    orig_len: u64,
-    blake3: [u8; 32],
+    filename: String,
+    total_len: u64,
+    file_hash: [u8; 32],
+    chunk_size: u32,
+    num_chunks: u32,
 }
-impl PayloadHeader {
-    fn new(orig_filename: String, orig_len: u64, blake3: [u8; 32]) -> Self {
-        let mut magic = [0u8; 8];
-        magic.copy_from_slice(MAGIC);
-        Self {
-            magic,
-            version: VERSION,
-            orig_filename,
-            orig_len,
-            blake3,
-        }
-    }
-    fn sanity_check(&self) -> Result<()> {
-        if &self.magic != MAGIC {
-            bail!("header magic mismatch");
-        }
-        if self.version != VERSION {
-            bail!("unsupported header version: {} (expected {})", self.version, VERSION);
-        }
-        Ok(())
-    }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct VisualChunk {
+    version: u16,
+    index: u32,
+    chunk_hash: [u8; 32],
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+enum Frame {
+    Header(VisualHeader),
+    Chunk(VisualChunk),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    Header = 0x01,
+    Chunk = 0x02,
 }
 
 // pretty logging
@@ -91,19 +100,7 @@ macro_rules! fail {
     ($($arg:tt)*) => { eprintln!("✘ {}", format!($($arg)*)); };
 }
 
-// -------------------- helpers --------------------
-
-fn is_png_file(path: &Path) -> Result<bool> {
-    let mut f = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Ok(false),
-    };
-    let mut sig = [0u8; 8];
-    if f.read_exact(&mut sig).is_ok() {
-        return Ok(sig == PNG_SIG);
-    }
-    Ok(false)
-}
+// -------------------- Hashing & verification --------------------
 
 fn blake3_hash_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut h = Hasher::new();
@@ -147,17 +144,115 @@ fn hex32(bytes: [u8; 32]) -> String {
     s
 }
 
-fn split_header_and_data(chunk_bytes: &[u8]) -> Result<(PayloadHeader, &[u8])> {
-    // postcard::take_from_bytes gives (T, remainder)
-    let (hdr, rest) = postcard::take_from_bytes::<PayloadHeader>(chunk_bytes)
-        .map_err(|e| anyhow!("deserializing header failed: {e}"))?;
-    Ok((hdr, rest))
+// -------------------- Frame pack/unpack --------------------
+
+fn pack_frame(frame: &Frame) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(1024);
+    out.extend_from_slice(MAGIC);
+    match frame {
+        Frame::Header(h) => {
+            out.push(FrameKind::Header as u8);
+            let body = postcard::to_allocvec(h)?;
+            out.extend_from_slice(&body);
+        }
+        Frame::Chunk(c) => {
+            out.push(FrameKind::Chunk as u8);
+            let body = postcard::to_allocvec(c)?;
+            out.extend_from_slice(&body);
+        }
+    }
+    Ok(out)
 }
 
-// -------------------- core encode/decode --------------------
+fn unpack_frame(payload: &[u8]) -> Result<Frame> {
+    if payload.len() < MAGIC.len() + 1 {
+        bail!("QR payload too short");
+    }
+    if &payload[..4] != MAGIC {
+        bail!("QR magic mismatch");
+    }
+    let kind = payload[4];
+    let body = &payload[5..];
+    match kind {
+        x if x == FrameKind::Header as u8 => {
+            let (h, rest) = postcard::take_from_bytes::<VisualHeader>(body)
+                .map_err(|e| anyhow!("header decode failed: {e}"))?;
+            if !rest.is_empty() { bail!("trailing bytes after header"); }
+            if h.version != VERSION { bail!("unsupported header version {}", h.version); }
+            Ok(Frame::Header(h))
+        }
+        x if x == FrameKind::Chunk as u8 => {
+            let (c, rest) = postcard::take_from_bytes::<VisualChunk>(body)
+                .map_err(|e| anyhow!("chunk decode failed: {e}"))?;
+            if !rest.is_empty() { bail!("trailing bytes after chunk"); }
+            if c.version != VERSION { bail!("unsupported chunk version {}", c.version); }
+            Ok(Frame::Chunk(c))
+        }
+        _ => bail!("unknown frame kind"),
+    }
+}
 
-fn encode_file_to_png(input: &Path) -> Result<PathBuf> {
-    step!("Encoding file {:?} → PNG with embedded data…", input.file_name().unwrap_or_default());
+// -------------------- QR helpers --------------------
+
+fn qr_for_bytes(data: &[u8]) -> Result<QrCode> {
+    // Highest ECC for robustness; crate chooses smallest version that fits.
+    QrCode::with_error_correction_level(data, EcLevel::H).map_err(|e| anyhow!("QR encode failed: {e}"))
+}
+
+fn render_qr_to_rgba(qr: &QrCode, module_px: u32, extra_quiet_zone_modules: u32) -> RgbaImage {
+    let w = qr.width() as u32;
+    let total_modules = w + extra_quiet_zone_modules * 2;
+    let size_px = total_modules * module_px;
+
+    let mut img: RgbaImage = ImageBuffer::from_pixel(size_px, size_px, Rgba([255, 255, 255, 255]));
+
+    for y in 0..w {
+        for x in 0..w {
+            // IMPORTANT FIX: Color, not bool
+            if qr[(x as usize, y as usize)] == Color::Dark {
+                let x0 = (x + extra_quiet_zone_modules) * module_px;
+                let y0 = (y + extra_quiet_zone_modules) * module_px;
+                for yy in 0..module_px {
+                    for xx in 0..module_px {
+                        img.put_pixel(x0 + xx, y0 + yy, Rgba([0, 0, 0, 255]));
+                    }
+                }
+            }
+        }
+    }
+    img
+}
+
+fn choose_chunk_size(bytes: usize) -> usize {
+    // Start at DEFAULT_CHUNK_SIZE and shrink until each chunk QR width <= MAX_MODULES_PER_QR.
+    let mut size = DEFAULT_CHUNK_SIZE.min(bytes.max(1));
+    let min = 64usize;
+    loop {
+        let probe_chunk = vec![0u8; size / 2]; // conservative (real frame adds overhead)
+        let frame = Frame::Chunk(VisualChunk {
+            version: VERSION,
+            index: 0,
+            chunk_hash: [0u8; 32],
+            data: probe_chunk,
+        });
+        let payload = pack_frame(&frame).unwrap();
+        if let Ok(qr) = qr_for_bytes(&payload) {
+            if qr.width() <= MAX_MODULES_PER_QR {
+                return size.max(min);
+            }
+        }
+        let next = size.saturating_sub(size / 5).max(min);
+        if next == size {
+            return size;
+        }
+        size = next;
+    }
+}
+
+// -------------------- Encode (file → visual PNG) --------------------
+
+fn encode_file_to_visual_png(input: &Path) -> Result<PathBuf> {
+    step!("Encoding file {:?} → visual PNG (QR mosaic)…", input.file_name().unwrap_or_default());
 
     step!("Reading & hashing input…");
     let bytes = fs::read(input).with_context(|| format!("read {:?}", input))?;
@@ -167,156 +262,249 @@ fn encode_file_to_png(input: &Path) -> Result<PathBuf> {
     }
     ok!("Input: {} bytes, BLAKE3={}", bytes.len(), hex32(file_hash));
 
-    let fname = input
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("unknown")
-        .to_string();
+    let filename = input.file_name().and_then(OsStr::to_str).unwrap_or("unknown").to_string();
 
-    let header = PayloadHeader::new(fname, bytes.len() as u64, file_hash);
+    step!("Computing chunk plan…");
+    let chunk_size = choose_chunk_size(bytes.len());
+    let num_chunks = (bytes.len() + chunk_size - 1) / chunk_size;
+    ok!("Chunk size: {} bytes, chunks: {}", chunk_size, num_chunks);
 
-    step!("Serializing header…");
-    let header_bytes: Vec<u8> =
-        postcard::to_allocvec(&header).context("postcard serialize header (enable `alloc` feature)")?;
-    ok!("Header size: {} bytes", header_bytes.len());
+    let header = VisualHeader {
+        version: VERSION,
+        filename: filename.clone(),
+        total_len: bytes.len() as u64,
+        file_hash,
+        chunk_size: chunk_size as u32,
+        num_chunks: num_chunks as u32,
+    };
+    let header_frame = Frame::Header(header);
 
-    step!("Building ancillary chunk…");
-    let ctype = achunk::ChunkType::from_ascii(&CHUNK_NAME).context("ChunkType::from_ascii")?;
-    let mut payload = Vec::with_capacity(header_bytes.len() + bytes.len());
-    payload.extend_from_slice(&header_bytes);
-    payload.extend_from_slice(&bytes);
-    let chunk = achunk::Chunk::new(ctype, payload).context("create chunk")?;
-    ok!("Chunk ready ({} bytes payload).", chunk.data.len());
-
-    // Create a tiny viewable image (8×8 RGBA) and paint a gradient
-    step!("Creating 8×8 RGBA canvas…");
-    let mut img = DynamicImage::new_rgba8(8, 8);
-    for y in 0..8 {
-        for x in 0..8 {
-            let v = (x * 28 + y * 10) as u8;
-            img.put_pixel(x, y, Rgba([v, 255u8.saturating_sub(v), 200, 255]));
+    step!("Building QR frames…");
+    let mut frames: Vec<Frame> = Vec::with_capacity(HEADER_REPLICATION + num_chunks);
+    for _ in 0..HEADER_REPLICATION {
+        if let Frame::Header(h) = &header_frame {
+            frames.push(Frame::Header(h.clone()));
         }
     }
-    ok!("Canvas ready.");
+    for i in 0..num_chunks {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(bytes.len());
+        let chunk = &bytes[start..end];
+        let c_hash = blake3_hash_bytes(chunk);
+        frames.push(Frame::Chunk(VisualChunk {
+            version: VERSION,
+            index: i as u32,
+            chunk_hash: c_hash,
+            data: chunk.to_vec(),
+        }));
+    }
 
-    // Choose output filename
-    let out_path = if let Some(ext) = input.extension().and_then(OsStr::to_str) {
+    // Encode frames to QR bitmaps
+    let mut qrs: Vec<RgbaImage> = Vec::with_capacity(frames.len());
+    for (idx, fr) in frames.iter().enumerate() {
+        let payload = pack_frame(fr)?;
+        let qr = qr_for_bytes(&payload)?;
+        let bmp = render_qr_to_rgba(&qr, MODULE_PX, 4);
+        qrs.push(bmp);
+        if idx % 25 == 0 {
+            step!("Encoded {} / {} QRs…", idx + 1, frames.len());
+        }
+    }
+    ok!("QRs encoded: {}", qrs.len());
+
+    // Compose into a grid
+    step!("Compositing QR grid…");
+    let n = qrs.len() as u32;
+    let cols = (f32::sqrt(n as f32).ceil()) as u32;
+    let rows = ((n + cols - 1) / cols) as u32;
+
+    let cell_w = qrs.iter().map(|im| im.width()).max().unwrap_or(0) + TILE_MARGIN_PX * 2;
+    let cell_h = qrs.iter().map(|im| im.height()).max().unwrap_or(0) + TILE_MARGIN_PX * 2;
+
+    let total_w = cols * cell_w + (cols + 1) * GRID_GAP_PX;
+    let total_h = rows * cell_h + (rows + 1) * GRID_GAP_PX;
+
+    let mut canvas: RgbaImage = ImageBuffer::from_pixel(total_w, total_h, Rgba([255, 255, 255, 255]));
+
+    for (i, qrimg) in qrs.into_iter().enumerate() {
+        let i = i as u32;
+        let cx = i % cols;
+        let cy = i / cols;
+
+        let x0 = GRID_GAP_PX + cx * (cell_w + GRID_GAP_PX);
+        let y0 = GRID_GAP_PX + cy * (cell_h + GRID_GAP_PX);
+
+        // center QR image within cell
+        let off_x = x0 + (cell_w - qrimg.width()) / 2;
+        let off_y = y0 + (cell_h - qrimg.height()) / 2;
+
+        imageops::overlay(&mut canvas, &qrimg, off_x as i64, off_y as i64);
+    }
+    ok!("Grid {}×{} ready ({}×{} px).", cols, rows, total_w, total_h);
+
+    // Output filename
+    let out = if let Some(ext) = input.extension().and_then(OsStr::to_str) {
         input.with_extension(format!("{ext}.png"))
     } else {
         input.with_extension("png")
     };
 
-    step!("Writing PNG to {:?}…", &out_path.file_name().unwrap_or_default());
-    // `png-achunk`'s Encoder implements `image::ImageEncoder` for image 0.24.x.
-    img.write_with_encoder(
-        achunk::Encoder::new_to_file(&out_path)
-            .context("encoder")?
-            .with_custom_chunk(chunk.clone()),
-    )
-    .context("writing PNG with custom chunk")?;
+    step!("Writing PNG to {:?}…", out.file_name().unwrap_or_default());
+    DynamicImage::ImageRgba8(canvas).save(&out).context("write png")?;
     ok!("PNG written.");
 
-    // Re-open and verify immediately
-    step!("Re-opening PNG to verify chunk & data…");
-    let chunks = achunk::Decoder::from_file(&out_path)
-        .context("decoder")?
-        .decode_ancillary_chunks()
-        .context("decode ancillary")?;
-    let Some(found) = chunks
-        .into_iter()
-        .find(|c| c.chunk_type.to_ascii().as_str() == CHUNK_NAME)
-    else {
-        bail!("verification failed: missing chunk after write");
-    };
-    ok!(
-        "Found chunk \"{}\" ({} bytes). CRC verified by decoder.",
-        CHUNK_NAME,
-        found.data.len()
-    );
-
-    step!("Parsing header back & verifying payload…");
-    let (hdr2, rest2) = split_header_and_data(&found.data)?;
-    hdr2.sanity_check()?;
-    let verified = verify_bytes(hdr2.orig_len, hdr2.blake3, UnverifiedBytes(rest2.to_vec()))?;
+    // Active proof: re-open and decode; verify we recover exact bytes
+    step!("Re-opening PNG for visual decode verification…");
+    let (hdr2, chunks2) = visual_decode_collect(&out)?;
+    let file_bytes = assemble_from_frames(&hdr2, chunks2)?;
+    let verified = verify_bytes(hdr2.total_len, hdr2.file_hash, UnverifiedBytes(file_bytes))?;
     if verified.as_slice() != bytes.as_slice() {
         bail!("post-write byte-for-byte comparison failed");
     }
-    ok!("Payload verified (length + BLAKE3 + exact bytes).");
+    ok!("Round-trip verification OK (length + BLAKE3 + exact bytes).");
 
     eprintln!();
-    ok!("ENCODE COMPLETE → {:?}", out_path.file_name().unwrap_or_default());
-    Ok(out_path)
+    ok!("ENCODE COMPLETE → {:?}", out.file_name().unwrap_or_default());
+    Ok(out)
 }
 
-fn decode_png_to_file(input: &Path) -> Result<PathBuf> {
-    step!("Decoding PNG {:?} → original file…", input.file_name().unwrap_or_default());
+// -------------------- Decode (visual image → file) --------------------
 
-    // Prove it's viewable by decoding with the `image` crate.
-    step!("Checking PNG decodes as an image…");
-    let _img = image::open(input).context("image::open PNG failed (not viewable?)")?;
-    ok!("PNG successfully decoded (viewable).");
+fn visual_decode_collect(img_path: &Path) -> Result<(VisualHeader, Vec<VisualChunk>)> {
+    // Load any common image format; convert to luma8 for quircs
+    let dynimg = image::open(img_path).with_context(|| format!("open {:?}", img_path))?;
+    let gray: GrayImage = dynimg.into_luma8();
 
-    // Extract ancillary chunks and find ours.
-    step!("Reading ancillary chunks…");
-    let chunks = achunk::Decoder::from_file(input)
-        .context("decoder")?
-        .decode_ancillary_chunks()
-        .context("decode ancillary")?;
-    let Some(found) = chunks
-        .into_iter()
-        .find(|c| c.chunk_type.to_ascii().as_str() == CHUNK_NAME)
-    else {
-        bail!("No embedded data chunk \"{}\" found; not created by this tool.", CHUNK_NAME);
-    };
-    ok!("Found chunk ({} bytes). CRC verified.", found.data.len());
+    let mut decoder = Quirc::default();
+    // IMPORTANT FIX: use `gray.as_raw()` and collect CodeIter
+    let codes: Vec<_> = decoder
+        .identify(gray.width() as usize, gray.height() as usize, gray.as_raw())
+        .collect();
 
-    // Parse header & verify payload
-    step!("Parsing header & verifying payload…");
-    let (hdr, rest) = split_header_and_data(&found.data)?;
-    hdr.sanity_check()?;
-    let verified = verify_bytes(hdr.orig_len, hdr.blake3, UnverifiedBytes(rest.to_vec()))?;
+    if codes.is_empty() {
+        bail!("No QR codes detected in image.");
+    }
+
+    let mut headers: Vec<VisualHeader> = Vec::new();
+    let mut chunks: Vec<VisualChunk> = Vec::new();
+
+    for code_res in codes {
+        let code = match code_res {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Ok(decoded) = code.decode() else { continue };
+        let payload = decoded.payload; // Vec<u8>
+        if let Ok(frame) = unpack_frame(&payload) {
+            match frame {
+                Frame::Header(h) => headers.push(h),
+                Frame::Chunk(c) => chunks.push(c),
+            }
+        }
+    }
+
+    if headers.is_empty() {
+        bail!("No header frames found.");
+    }
+
+    // majority by identical header fields
+    use std::collections::HashMap;
+    fn hdr_key(h: &VisualHeader) -> (u16, String, u64, [u8; 32], u32, u32) {
+        (h.version, h.filename.clone(), h.total_len, h.file_hash, h.chunk_size, h.num_chunks)
+    }
+    let mut counts: HashMap<(u16, String, u64, [u8; 32], u32, u32), usize> = HashMap::new();
+    for h in &headers {
+        *counts.entry(hdr_key(h)).or_default() += 1;
+    }
+    let (key, _) = counts.into_iter().max_by_key(|(_, c)| *c).unwrap();
+    let header = headers.into_iter().find(|h| hdr_key(h) == key).unwrap();
+
     ok!(
-        "Header OK. len={} hash={}",
-        hdr.orig_len,
-        hex32(hdr.blake3)
+        "Collected frames: header x{}, chunks x{}.",
+        HEADER_REPLICATION, chunks.len()
+    );
+    Ok((header, chunks))
+}
+
+fn assemble_from_frames(header: &VisualHeader, mut chunks: Vec<VisualChunk>) -> Result<Vec<u8>> {
+    // Keep only valid chunks: index in range & hash matches & unique index
+    let mut by_index: Vec<Option<Vec<u8>>> = vec![None; header.num_chunks as usize];
+    let mut valid = 0usize;
+    for c in chunks.drain(..) {
+        let idx = c.index as usize;
+        if idx >= by_index.len() {
+            continue;
+        }
+        if blake3_hash_bytes(&c.data) != c.chunk_hash {
+            continue;
+        }
+        if by_index[idx].is_none() {
+            by_index[idx] = Some(c.data);
+            valid += 1;
+        }
+    }
+    if valid < by_index.len() {
+        bail!("missing chunks: have {} / {}", valid, by_index.len());
+    }
+
+    let mut out = Vec::with_capacity(header.total_len as usize);
+    for (i, opt) in by_index.into_iter().enumerate() {
+        let mut chunk = opt.ok_or_else(|| anyhow!("missing chunk at index {}", i))?;
+        out.append(&mut chunk);
+    }
+    out.truncate(header.total_len as usize);
+    if blake3_hash_bytes(&out) != header.file_hash {
+        bail!("assembled file hash mismatch");
+    }
+    Ok(out)
+}
+
+fn decode_image_to_file(input: &Path) -> Result<PathBuf> {
+    step!("Decoding image {:?} → original file…", input.file_name().unwrap_or_default());
+
+    let (header, chunks) = visual_decode_collect(input)?;
+    ok!(
+        "Header: file {:?}, len={}, chunks={}",
+        header.filename, header.total_len, header.num_chunks
     );
 
-    // Decide output path
-    let desired_name = if hdr.orig_filename.trim().is_empty() {
+    let file_bytes = assemble_from_frames(&header, chunks)?;
+    let verified = verify_bytes(header.total_len, header.file_hash, UnverifiedBytes(file_bytes))?;
+
+    // Output path (idempotent behavior)
+    let desired_name = if header.filename.trim().is_empty() {
         "decoded.bin".to_string()
     } else {
-        hdr.orig_filename.clone()
+        header.filename.clone()
     };
     let mut desired_path = input.with_file_name(&desired_name);
 
-    // If desired file exists, but *already matches* expected length/hash, keep it.
     if desired_path.exists() {
         let (h, l) = blake3_hash_file(&desired_path)?;
-        if l == hdr.orig_len && h == hdr.blake3 {
-            ok!(
-                "Existing file {:?} already matches embedded data; nothing to write.",
-                desired_path.file_name().unwrap_or_default()
-            );
+        if l == header.total_len && h == header.file_hash {
+            ok!("Existing file matches payload; nothing to write.");
             eprintln!();
             ok!("DECODE COMPLETE → {:?}", desired_path.file_name().unwrap_or_default());
             return Ok(desired_path);
         }
-        // Else, avoid overwrite: append .restored
-        warn!("{:?} exists with different content; appending .restored", desired_path.file_name().unwrap_or_default());
+        warn!(
+            "{:?} exists with different content; appending .restored",
+            desired_path.file_name().unwrap_or_default()
+        );
         desired_path = input.with_file_name(format!("{}.restored", desired_name));
     }
 
-    // Write and re-verify
     step!("Writing reconstructed file to {:?}…", desired_path.file_name().unwrap_or_default());
     fs::write(&desired_path, verified.as_slice()).with_context(|| format!("write {:?}", desired_path))?;
     ok!("File written.");
 
+    // Re-verify from disk
     step!("Re-reading written file to re-verify…");
     let (rehash, relen) = blake3_hash_file(&desired_path)?;
-    if relen != hdr.orig_len {
-        bail!("output length mismatch after write ({} vs {})", relen, hdr.orig_len);
+    if relen != header.total_len {
+        bail!("output length mismatch after write ({} vs {})", relen, header.total_len);
     }
-    if rehash != hdr.blake3 {
+    if rehash != header.file_hash {
         bail!("output BLAKE3 mismatch after write");
     }
     ok!("Output verified (length + BLAKE3).");
@@ -326,7 +514,7 @@ fn decode_png_to_file(input: &Path) -> Result<PathBuf> {
     Ok(desired_path)
 }
 
-// -------------------- entry --------------------
+// -------------------- Entry: one-arg tool --------------------
 
 fn main() {
     if let Err(e) = real_main() {
@@ -338,7 +526,7 @@ fn main() {
 fn real_main() -> Result<()> {
     let mut args = env::args_os().skip(1);
     let Some(path_os) = args.next() else {
-        eprintln!("Usage: pixpack <path-to-file-or-png>");
+        eprintln!("Usage: pixpack <path-to-file-or-image>");
         bail!("missing required argument");
     };
     if args.next().is_some() {
@@ -349,15 +537,21 @@ fn real_main() -> Result<()> {
         bail!("path does not exist: {:?}", path);
     }
 
-    if is_png_file(&path)? {
-        decode_png_to_file(&path)?;
-    } else {
-        encode_file_to_png(&path)?;
+    // If it looks like an image, try to decode visually first.
+    if image::open(&path).is_ok() {
+        if let Ok(_out) = decode_image_to_file(&path) {
+            return Ok(());
+        } else {
+            step!("Input is an image but not a pixpack QR mosaic; proceeding to encode it as data.");
+        }
     }
+
+    // Encode anything else (including images without pixpack payload) into a new PNG QR mosaic.
+    encode_file_to_visual_png(&path)?;
     Ok(())
 }
 
-// -------------------- tests --------------------
+// -------------------- Tests --------------------
 
 #[cfg(test)]
 mod tests {
@@ -386,192 +580,191 @@ mod tests {
         out
     }
 
-    // ---------- Unit-ish tests ----------
     #[test]
-    fn header_roundtrip_postcard() -> Result<()> {
-        let hdr = PayloadHeader::new("f.bin".into(), 1234, [7u8; 32]);
-        let bytes = postcard::to_allocvec(&hdr)?;
-        let (back, rest) = postcard::take_from_bytes::<PayloadHeader>(&bytes)?;
-        assert_eq!(back.orig_len, 1234);
-        assert_eq!(rest.len(), 0);
-        back.sanity_check()?;
+    fn frame_header_roundtrip() -> Result<()> {
+        let h = VisualHeader {
+            version: super::VERSION,
+            filename: "x.bin".into(),
+            total_len: 123,
+            file_hash: [1u8; 32],
+            chunk_size: 256,
+            num_chunks: 2,
+        };
+        let fr = super::Frame::Header(h);
+        let b = super::pack_frame(&fr)?;
+        let fr2 = super::unpack_frame(&b)?;
+        match fr2 {
+            super::Frame::Header(h2) => {
+                assert_eq!(h2.filename, "x.bin");
+                assert_eq!(h2.total_len, 123);
+                assert_eq!(h2.chunk_size, 256);
+                assert_eq!(h2.num_chunks, 2);
+            }
+            _ => panic!("wrong frame kind"),
+        }
         Ok(())
     }
 
     #[test]
-    fn is_png_signature_check_works() -> Result<()> {
-        let dir = tempdir()?;
-        let png = dir.path().join("sigcheck.png");
-        let mut img = DynamicImage::new_rgba8(2, 2);
-        img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
-        img.save(&png)?;
-        assert!(is_png_file(&png)?);
-
-        let not_png = dir.path().join("file.txt");
-        fs::write(&not_png, b"not a png")?;
-        assert!(!is_png_file(&not_png)?);
+    fn frame_chunk_roundtrip() -> Result<()> {
+        let c = VisualChunk {
+            version: super::VERSION,
+            index: 7,
+            chunk_hash: [2u8; 32],
+            data: b"hello".to_vec(),
+        };
+        let fr = super::Frame::Chunk(c);
+        let b = super::pack_frame(&fr)?;
+        let fr2 = super::unpack_frame(&b)?;
+        match fr2 {
+            super::Frame::Chunk(c2) => {
+                assert_eq!(c2.index, 7);
+                assert_eq!(&c2.data, b"hello");
+            }
+            _ => panic!("wrong frame kind"),
+        }
         Ok(())
+    }
+
+    #[test]
+    fn choose_chunk_size_is_reasonable() {
+        let s = super::choose_chunk_size(50_000);
+        assert!(s >= 64 && s <= 2000, "chunk size chosen: {}", s);
     }
 
     // ---------- Integration-style tests (touch disk) ----------
+
     #[test]
-    fn roundtrip_small_text_file() -> Result<()> {
+    fn roundtrip_small_text() -> Result<()> {
         let dir = tempdir()?;
-        let input = dir.path().join("sample.txt");
-        fs::write(&input, b"Hello ancillaries!\nThis is a test.\n")?;
-
-        let png = encode_file_to_png(&input)?;
-        assert!(png.exists());
-        assert!(is_png_file(&png)?);
-
-        let out = decode_png_to_file(&png)?;
-        assert!(out.exists());
-
-        let orig = fs::read(&input)?;
-        let back = fs::read(&out)?;
-        assert_eq!(orig, back);
+        let input = dir.path().join("note.txt");
+        fs::write(&input, b"Hello visual QR world!\n")?;
+        let png = super::encode_file_to_visual_png(&input)?;
+        let out = super::decode_image_to_file(&png)?;
+        assert_eq!(fs::read(&input)?, fs::read(&out)?);
         Ok(())
     }
 
     #[test]
-    fn roundtrip_large_random_binary() -> Result<()> {
+    fn roundtrip_large_binary() -> Result<()> {
         let dir = tempdir()?;
         let input = dir.path().join("blob.bin");
-        // 256 KiB pseudo-random binary
-        let data = gen_bytes(256 * 1024, 0xBAD5EED);
+        let data = gen_bytes(300 * 1024, 0xFEEDFACE);
         fs::write(&input, &data)?;
-
-        let png = encode_file_to_png(&input)?;
-        let out = decode_png_to_file(&png)?;
-
-        let back = fs::read(&out)?;
-        assert_eq!(data.len(), back.len(), "length mismatch");
-        assert_eq!(blake3_hash_bytes(&data), blake3_hash_bytes(&back), "hash mismatch");
-        assert_eq!(data, back, "bytes mismatch");
+        let png = super::encode_file_to_visual_png(&input)?;
+        let out = super::decode_image_to_file(&png)?;
+        assert_eq!(blake3_hash_bytes(&data), blake3_hash_file(&out)?.0);
         Ok(())
     }
 
     #[test]
-    fn decode_plain_png_fails() -> Result<()> {
-        let dir = tempdir()?;
-        let png = dir.path().join("plain.png");
-
-        // Write a plain PNG without our chunk.
-        let mut img = DynamicImage::new_rgba8(4, 4);
-        for y in 0..4 {
-            for x in 0..4 {
-                img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
-            }
-        }
-        img.save(&png)?;
-
-        let err = decode_png_to_file(&png).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("No embedded data chunk"), "unexpected: {msg}");
-        Ok(())
-    }
-
-    #[test]
-    fn decode_filename_conflict_appends_restored() -> Result<()> {
-        let dir = tempdir()?;
-        let input = dir.path().join("report.dat");
-        fs::write(&input, b"EDGE CASE FILE")?;
-
-        // Encode → PNG
-        let png = encode_file_to_png(&input)?;
-        // Pre-create a file with the expected decoded name but *different content*
-        let conflict = png.with_file_name("report.dat");
-        fs::write(&conflict, b"pre-existing different")?;
-
-        // Decode → should produce "report.dat.restored"
-        let out = decode_png_to_file(&png)?;
-        assert!(out.file_name().unwrap().to_str().unwrap().ends_with(".restored"));
-        let back = fs::read(&out)?;
-        assert_eq!(back, b"EDGE CASE FILE");
-        Ok(())
-    }
-
-    #[test]
-    fn filename_preserved_on_decode_when_same_file_already_present() -> Result<()> {
-        // If the file already exists *and* matches len/hash, we keep the original name (no .restored).
-        let dir = tempdir()?;
-        let input = dir.path().join("very_long_filename.with.dots.and-spaces .bin");
-        fs::write(&input, b"CONTENT")?;
-        let png = encode_file_to_png(&input)?;
-
-        // Now decode right next to the original—should detect same hash/len and NOT write ".restored".
-        let out = decode_png_to_file(&png)?;
-        assert_eq!(
-            out.file_name().unwrap().to_str().unwrap(),
-            "very_long_filename.with.dots.and-spaces .bin"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn tamper_detection_via_hash_mismatch() -> Result<()> {
-        let dir = tempdir()?;
-        let input = dir.path().join("secret.bin");
-        fs::write(&input, b"THIS IS TOP SECRET")?;
-
-        // Encode → PNG
-        let png = encode_file_to_png(&input)?;
-
-        // Read back image + chunks fully
-        let (img, chunks) = achunk::Decoder::from_file(&png)
-            .context("decoder")?
-            .decode_all()
-            .context("decode_all")?;
-
-        // Find our chunk, parse header, flip a bit in payload
-        let my = chunks
-            .into_iter()
-            .find(|c| c.chunk_type.to_ascii().as_str() == CHUNK_NAME)
-            .expect("chunk not found");
-        let (hdr, data) = super::split_header_and_data(&my.data)?;
-        hdr.sanity_check()?;
-
-        let mut tampered_payload = data.to_vec();
-        if !tampered_payload.is_empty() {
-            tampered_payload[0] ^= 0b0000_0001; // flip a bit
-        } else {
-            tampered_payload.extend_from_slice(b"x");
-        }
-
-        // Rebuild chunk = header || tampered_payload
-        let mut rebuilt = postcard::to_allocvec(&hdr)?;
-        rebuilt.extend_from_slice(&tampered_payload);
-
-        let ctype = achunk::ChunkType::from_ascii(&CHUNK_NAME)?;
-        let tampered_chunk = achunk::Chunk::new(ctype, rebuilt)?;
-
-        // Write a *new* PNG with the tampered chunk
-        let tampered_png = png.with_file_name("tampered.png");
-        img.write_with_encoder(
-            achunk::Encoder::new_to_file(&tampered_png)?.with_custom_chunk(tampered_chunk),
-        )?;
-
-        // Now decoding should fail due to hash mismatch
-        let err = super::decode_png_to_file(&tampered_png).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("hash mismatch"), "unexpected error: {msg}");
-        Ok(())
-    }
-
-    #[test]
-    fn decode_idempotent_second_run_detects_existing_matching_file() -> Result<()> {
+    fn decode_idempotent_when_same_file_exists() -> Result<()> {
         let dir = tempdir()?;
         let input = dir.path().join("artifact.bin");
         fs::write(&input, b"XYZ")?;
-        let png = encode_file_to_png(&input)?;
-
-        // First decode
-        let out1 = decode_png_to_file(&png)?;
+        let png = super::encode_file_to_visual_png(&input)?;
+        let out1 = super::decode_image_to_file(&png)?;
         assert_eq!(out1.file_name().unwrap().to_str().unwrap(), "artifact.bin");
+        let out2 = super::decode_image_to_file(&png)?;
+        assert_eq!(out2, out1);
+        Ok(())
+    }
 
-        // Second decode should detect existing matching file and return same path (no ".restored")
-        let out2 = decode_png_to_file(&png)?;
-        assert_eq!(out2.file_name().unwrap().to_str().unwrap(), "artifact.bin");
+    #[test]
+    fn screenshot_like_rescale_still_decodes() -> Result<()> {
+        // Simulate a screenshot: rescale by 200% and re-save as PNG
+        let dir = tempdir()?;
+        let input = dir.path().join("doc.txt");
+        fs::write(&input, b"Pixels survive screenshots!")?;
+        let png = super::encode_file_to_visual_png(&input)?;
+        let img = image::open(&png)?.to_rgba8();
+        let big = imageops::resize(&img, img.width() * 2, img.height() * 2, imageops::FilterType::Nearest);
+        let big_path = png.with_file_name("screenshot.png");
+        DynamicImage::ImageRgba8(big).save(&big_path)?;
+        let out = super::decode_image_to_file(&big_path)?;
+        assert_eq!(fs::read(&input)?, fs::read(&out)?);
+        Ok(())
+    }
+
+    #[test]
+    fn filename_conflict_restored_when_different() -> Result<()> {
+        let dir = tempdir()?;
+        let input = dir.path().join("report.dat");
+        fs::write(&input, b"ORIGINAL")?;
+        let png = super::encode_file_to_visual_png(&input)?;
+
+        // Create a conflicting file with different content
+        let conflict = png.with_file_name("report.dat");
+        fs::write(&conflict, b"DIFFERENT")?;
+
+        let out = super::decode_image_to_file(&png)?;
+        assert!(out.file_name().unwrap().to_str().unwrap().ends_with(".restored"));
+        assert_eq!(fs::read(out)?, b"ORIGINAL");
+        Ok(())
+    }
+
+    #[test]
+    fn tamper_detection_hash_mismatch() -> Result<()> {
+        // Decode, corrupt one chunk frame re-encoded into a *new* QR mosaic, then fail.
+        let dir = tempdir()?;
+        let input = dir.path().join("secret.bin");
+        fs::write(&input, b"TOP_SECRET_BYTES")?;
+        let png = super::encode_file_to_visual_png(&input)?;
+
+        // Load & decode frames
+        let (hdr, mut chunks) = super::visual_decode_collect(&png)?;
+        // Corrupt first chunk if any
+        if let Some(first) = chunks.get_mut(0) {
+            if !first.data.is_empty() {
+                first.data[0] ^= 1;
+                first.chunk_hash = blake3_hash_bytes(&first.data);
+            }
+        }
+        // Re-assemble into a forged image (reuse normal render)
+        let mut frames: Vec<super::Frame> = Vec::new();
+        for _ in 0..super::HEADER_REPLICATION {
+            frames.push(super::Frame::Header(hdr.clone()));
+        }
+        for c in &chunks {
+            frames.push(super::Frame::Chunk(super::VisualChunk {
+                version: super::VERSION,
+                index: c.index,
+                chunk_hash: c.chunk_hash,
+                data: c.data.clone(),
+            }));
+        }
+        // Build QR grid quickly
+        let mut qrs: Vec<RgbaImage> = Vec::new();
+        for fr in &frames {
+            let payload = super::pack_frame(fr)?;
+            let qr = super::qr_for_bytes(&payload)?;
+            qrs.push(super::render_qr_to_rgba(&qr, super::MODULE_PX, 4));
+        }
+        // Compose simple grid
+        let cols = (f32::sqrt(qrs.len() as f32).ceil()) as u32;
+        let rows = ((qrs.len() as u32 + cols - 1) / cols) as u32;
+        let cell_w = qrs.iter().map(|im| im.width()).max().unwrap() + super::TILE_MARGIN_PX * 2;
+        let cell_h = qrs.iter().map(|im| im.height()).max().unwrap() + super::TILE_MARGIN_PX * 2;
+        let total_w = cols * cell_w + (cols + 1) * super::GRID_GAP_PX;
+        let total_h = rows * cell_h + (rows + 1) * super::GRID_GAP_PX;
+        let mut canvas: RgbaImage = ImageBuffer::from_pixel(total_w, total_h, Rgba([255, 255, 255, 255]));
+        for (i, qrimg) in qrs.into_iter().enumerate() {
+            let i = i as u32;
+            let cx = i % cols;
+            let cy = i / cols;
+            let x0 = super::GRID_GAP_PX + cx * (cell_w + super::GRID_GAP_PX);
+            let y0 = super::GRID_GAP_PX + cy * (cell_h + super::GRID_GAP_PX);
+            let off_x = x0 + (cell_w - qrimg.width()) / 2;
+            let off_y = y0 + (cell_h - qrimg.height()) / 2;
+            imageops::overlay(&mut canvas, &qrimg, off_x as i64, off_y as i64);
+        }
+        let forged = png.with_file_name("forged.png");
+        DynamicImage::ImageRgba8(canvas).save(&forged)?;
+
+        // Now decoding should fail if corruption changed overall file hash
+        let err = super::decode_image_to_file(&forged).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hash mismatch") || msg.contains("missing chunks") || msg.contains("assembled file hash mismatch"));
         Ok(())
     }
 }
