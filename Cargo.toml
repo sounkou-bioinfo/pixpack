@@ -1,17 +1,16 @@
 [package]
 name = "pixpack"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1"
 blake3 = "1.8"
-# Pin image to match png-achunk's dependency to avoid multiple image versions in graph.
-image = { version = "=0.24.7", default-features = true, features = ["png"] }
-png-achunk = "0.1.0"
-serde = { version = "1.0", features = ["derive"] }
+image = "0.25"
+qrcode = "0.14.1"
+quircs = "0.10.2"
+serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
 
 [dev-dependencies]
-tempfile = "3.20"
-
+tempfile = "3"
