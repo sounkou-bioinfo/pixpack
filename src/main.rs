@@ -40,10 +40,16 @@ const VERSION: u16 = 1;
 // Visual/layout parameters
 const DEFAULT_CHUNK_SIZE: usize = 800;   // baseline; auto-tuned down if QR size too big
 const MAX_MODULES_PER_QR: usize = 85;    // cap modules per side to stay readable/robust
-const MODULE_PX: u32 = 10;               // pixels per module for each QR when rendered
+const DEFAULT_MODULE_PX: u32 = 10;       // initial pixels per module
+const MIN_MODULE_PX: u32 = 2;            // minimum pixels per module (avoid unreadable)
 const TILE_MARGIN_PX: u32 = 20;          // white padding around each QR tile
 const GRID_GAP_PX: u32 = 20;             // spacing between tiles
 const HEADER_REPLICATION: usize = 3;     // repeat header QR for robustness
+const QUIET_ZONE_MODULES: u32 = 4;       // additional quiet zone around QR content
+const MAX_CANVAS_DIM: u32 = 8000;        // keep final PNG within this bound (both width & height)
+
+// Decode fallbacks
+const THRESHOLDS: &[u8] = &[180, 160, 140, 128, 110, 96];
 
 #[derive(Debug, Clone)]
 struct UnverifiedBytes(Vec<u8>);
@@ -208,7 +214,6 @@ fn render_qr_to_rgba(qr: &QrCode, module_px: u32, extra_quiet_zone_modules: u32)
 
     for y in 0..w {
         for x in 0..w {
-            // IMPORTANT FIX: Color, not bool
             if qr[(x as usize, y as usize)] == Color::Dark {
                 let x0 = (x + extra_quiet_zone_modules) * module_px;
                 let y0 = (y + extra_quiet_zone_modules) * module_px;
@@ -247,6 +252,95 @@ fn choose_chunk_size(bytes: usize) -> usize {
         }
         size = next;
     }
+}
+
+// Build QR codes once; decide layout & scale before rendering bitmaps.
+fn frames_to_qrcodes(frames: &[Frame]) -> Result<Vec<QrCode>> {
+    let mut out = Vec::with_capacity(frames.len());
+    for (idx, fr) in frames.iter().enumerate() {
+        let payload = pack_frame(fr)?;
+        let qr = qr_for_bytes(&payload)?;
+        out.push(qr);
+        if idx % 25 == 0 {
+            step!("Encoded {} / {} QRs…", idx + 1, frames.len());
+        }
+    }
+    Ok(out)
+}
+
+fn estimate_cell_size(modules: u32, module_px: u32) -> (u32, u32) {
+    // Total QR bitmap size with quiet zone, then add tile margins.
+    let total_modules = modules + QUIET_ZONE_MODULES * 2;
+    let side_px = total_modules * module_px;
+    let cell_w = side_px + TILE_MARGIN_PX * 2;
+    let cell_h = side_px + TILE_MARGIN_PX * 2;
+    (cell_w, cell_h)
+}
+
+fn choose_layout(qr_modules_max: u32, n: u32) -> (u32, u32, u32) {
+    // Pick a module_px (down to MIN_MODULE_PX) and columns that keep canvas within MAX_CANVAS_DIM.
+    let mut module_px = DEFAULT_MODULE_PX;
+    loop {
+        let (cell_w, cell_h) = estimate_cell_size(qr_modules_max, module_px);
+
+        // Choose columns as many as fit within MAX_CANVAS_DIM
+        let max_cols = ((MAX_CANVAS_DIM.saturating_sub(GRID_GAP_PX)) / (cell_w + GRID_GAP_PX)).max(1);
+        let cols = max_cols.min(n.max(1));
+        let rows = ((n + cols - 1) / cols).max(1);
+
+        let total_w = cols * cell_w + (cols + 1) * GRID_GAP_PX;
+        let total_h = rows * cell_h + (rows + 1) * GRID_GAP_PX;
+
+        if total_w <= MAX_CANVAS_DIM && total_h <= MAX_CANVAS_DIM {
+            return (module_px, cols, rows);
+        }
+
+        if module_px == MIN_MODULE_PX {
+            // Give up shrinking; return whatever we have (may exceed bound, but avoids infinite loop)
+            return (module_px, cols, rows);
+        }
+        module_px -= 1;
+    }
+}
+
+fn layout_and_render_grid(qrs: &[QrCode]) -> RgbaImage {
+    let n = qrs.len() as u32;
+    let qr_modules_max = qrs.iter().map(|q| q.width() as u32).max().unwrap_or(21);
+    let (module_px, cols, rows) = choose_layout(qr_modules_max, n);
+
+    let (cell_w, cell_h) = estimate_cell_size(qr_modules_max, module_px);
+    let total_w = cols * cell_w + (cols + 1) * GRID_GAP_PX;
+    let total_h = rows * cell_h + (rows + 1) * GRID_GAP_PX;
+
+    step!(
+        "Compositing QR grid… (module_px={}, cells={}×{}, canvas={}×{} px)",
+        module_px,
+        cols,
+        rows,
+        total_w,
+        total_h
+    );
+
+    let mut canvas: RgbaImage = ImageBuffer::from_pixel(total_w, total_h, Rgba([255, 255, 255, 255]));
+
+    for (i, qr) in qrs.iter().enumerate() {
+        let i = i as u32;
+        let cx = i % cols;
+        let cy = i / cols;
+
+        let x0 = GRID_GAP_PX + cx * (cell_w + GRID_GAP_PX);
+        let y0 = GRID_GAP_PX + cy * (cell_h + GRID_GAP_PX);
+
+        // Render bitmap for this QR with chosen module_px and quiet zone
+        let bmp = render_qr_to_rgba(qr, module_px, QUIET_ZONE_MODULES);
+
+        // Center bitmap within cell
+        let off_x = x0 + (cell_w - bmp.width()) / 2;
+        let off_y = y0 + (cell_h - bmp.height()) / 2;
+
+        imageops::overlay(&mut canvas, &bmp, off_x as i64, off_y as i64);
+    }
+    canvas
 }
 
 // -------------------- Encode (file → visual PNG) --------------------
@@ -299,48 +393,12 @@ fn encode_file_to_visual_png(input: &Path) -> Result<PathBuf> {
         }));
     }
 
-    // Encode frames to QR bitmaps
-    let mut qrs: Vec<RgbaImage> = Vec::with_capacity(frames.len());
-    for (idx, fr) in frames.iter().enumerate() {
-        let payload = pack_frame(fr)?;
-        let qr = qr_for_bytes(&payload)?;
-        let bmp = render_qr_to_rgba(&qr, MODULE_PX, 4);
-        qrs.push(bmp);
-        if idx % 25 == 0 {
-            step!("Encoded {} / {} QRs…", idx + 1, frames.len());
-        }
-    }
-    ok!("QRs encoded: {}", qrs.len());
+    // Encode frames to QR codes (bit matrices), report progress.
+    let qrcodes = frames_to_qrcodes(&frames)?;
+    ok!("QRs encoded: {}", qrcodes.len());
 
-    // Compose into a grid
-    step!("Compositing QR grid…");
-    let n = qrs.len() as u32;
-    let cols = (f32::sqrt(n as f32).ceil()) as u32;
-    let rows = ((n + cols - 1) / cols) as u32;
-
-    let cell_w = qrs.iter().map(|im| im.width()).max().unwrap_or(0) + TILE_MARGIN_PX * 2;
-    let cell_h = qrs.iter().map(|im| im.height()).max().unwrap_or(0) + TILE_MARGIN_PX * 2;
-
-    let total_w = cols * cell_w + (cols + 1) * GRID_GAP_PX;
-    let total_h = rows * cell_h + (rows + 1) * GRID_GAP_PX;
-
-    let mut canvas: RgbaImage = ImageBuffer::from_pixel(total_w, total_h, Rgba([255, 255, 255, 255]));
-
-    for (i, qrimg) in qrs.into_iter().enumerate() {
-        let i = i as u32;
-        let cx = i % cols;
-        let cy = i / cols;
-
-        let x0 = GRID_GAP_PX + cx * (cell_w + GRID_GAP_PX);
-        let y0 = GRID_GAP_PX + cy * (cell_h + GRID_GAP_PX);
-
-        // center QR image within cell
-        let off_x = x0 + (cell_w - qrimg.width()) / 2;
-        let off_y = y0 + (cell_h - qrimg.height()) / 2;
-
-        imageops::overlay(&mut canvas, &qrimg, off_x as i64, off_y as i64);
-    }
-    ok!("Grid {}×{} ready ({}×{} px).", cols, rows, total_w, total_h);
+    // Compose into a grid with adaptive module size to respect canvas limits.
+    let canvas = layout_and_render_grid(&qrcodes);
 
     // Output filename
     let out = if let Some(ext) = input.extension().and_then(OsStr::to_str) {
@@ -370,20 +428,19 @@ fn encode_file_to_visual_png(input: &Path) -> Result<PathBuf> {
 
 // -------------------- Decode (visual image → file) --------------------
 
-fn visual_decode_collect(img_path: &Path) -> Result<(VisualHeader, Vec<VisualChunk>)> {
-    // Load any common image format; convert to luma8 for quircs
-    let dynimg = image::open(img_path).with_context(|| format!("open {:?}", img_path))?;
-    let gray: GrayImage = dynimg.into_luma8();
+fn threshold(gray: &GrayImage, t: u8) -> GrayImage {
+    let mut out = gray.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = if p.0[0] >= t { 255 } else { 0 };
+    }
+    out
+}
 
+fn try_detect(gray: &GrayImage) -> (Vec<VisualHeader>, Vec<VisualChunk>) {
     let mut decoder = Quirc::default();
-    // IMPORTANT FIX: use `gray.as_raw()` and collect CodeIter
     let codes: Vec<_> = decoder
         .identify(gray.width() as usize, gray.height() as usize, gray.as_raw())
         .collect();
-
-    if codes.is_empty() {
-        bail!("No QR codes detected in image.");
-    }
 
     let mut headers: Vec<VisualHeader> = Vec::new();
     let mut chunks: Vec<VisualChunk> = Vec::new();
@@ -402,12 +459,33 @@ fn visual_decode_collect(img_path: &Path) -> Result<(VisualHeader, Vec<VisualChu
             }
         }
     }
+    (headers, chunks)
+}
+
+fn visual_decode_collect(img_path: &Path) -> Result<(VisualHeader, Vec<VisualChunk>)> {
+    // Load any common image format; convert to luma8.
+    let dynimg = image::open(img_path).with_context(|| format!("open {:?}", img_path))?;
+    let base_gray: GrayImage = dynimg.into_luma8();
+
+    // Try original
+    let (mut headers, mut chunks) = try_detect(&base_gray);
+    if headers.is_empty() {
+        // Try thresholded variants
+        for &t in THRESHOLDS {
+            step!("No headers on first pass; retrying with threshold {t} …");
+            let th = threshold(&base_gray, t);
+            (headers, chunks) = try_detect(&th);
+            if !headers.is_empty() {
+                break;
+            }
+        }
+    }
 
     if headers.is_empty() {
         bail!("No header frames found.");
     }
 
-    // majority by identical header fields
+    // Majority by identical header fields
     use std::collections::HashMap;
     fn hdr_key(h: &VisualHeader) -> (u16, String, u64, [u8; 32], u32, u32) {
         (h.version, h.filename.clone(), h.total_len, h.file_hash, h.chunk_size, h.num_chunks)
@@ -720,7 +798,7 @@ mod tests {
                 first.chunk_hash = blake3_hash_bytes(&first.data);
             }
         }
-        // Re-assemble into a forged image (reuse normal render)
+        // Forge a new image with the (possibly corrupted) frames
         let mut frames: Vec<super::Frame> = Vec::new();
         for _ in 0..super::HEADER_REPLICATION {
             frames.push(super::Frame::Header(hdr.clone()));
@@ -733,38 +811,21 @@ mod tests {
                 data: c.data.clone(),
             }));
         }
-        // Build QR grid quickly
-        let mut qrs: Vec<RgbaImage> = Vec::new();
-        for fr in &frames {
-            let payload = super::pack_frame(fr)?;
-            let qr = super::qr_for_bytes(&payload)?;
-            qrs.push(super::render_qr_to_rgba(&qr, super::MODULE_PX, 4));
-        }
-        // Compose simple grid
-        let cols = (f32::sqrt(qrs.len() as f32).ceil()) as u32;
-        let rows = ((qrs.len() as u32 + cols - 1) / cols) as u32;
-        let cell_w = qrs.iter().map(|im| im.width()).max().unwrap() + super::TILE_MARGIN_PX * 2;
-        let cell_h = qrs.iter().map(|im| im.height()).max().unwrap() + super::TILE_MARGIN_PX * 2;
-        let total_w = cols * cell_w + (cols + 1) * super::GRID_GAP_PX;
-        let total_h = rows * cell_h + (rows + 1) * super::GRID_GAP_PX;
-        let mut canvas: RgbaImage = ImageBuffer::from_pixel(total_w, total_h, Rgba([255, 255, 255, 255]));
-        for (i, qrimg) in qrs.into_iter().enumerate() {
-            let i = i as u32;
-            let cx = i % cols;
-            let cy = i / cols;
-            let x0 = super::GRID_GAP_PX + cx * (cell_w + super::GRID_GAP_PX);
-            let y0 = super::GRID_GAP_PX + cy * (cell_h + super::GRID_GAP_PX);
-            let off_x = x0 + (cell_w - qrimg.width()) / 2;
-            let off_y = y0 + (cell_h - qrimg.height()) / 2;
-            imageops::overlay(&mut canvas, &qrimg, off_x as i64, off_y as i64);
-        }
+        let qrs = super::frames_to_qrcodes(&frames)?;
+        let canvas = super::layout_and_render_grid(&qrs);
+
         let forged = png.with_file_name("forged.png");
         DynamicImage::ImageRgba8(canvas).save(&forged)?;
 
-        // Now decoding should fail if corruption changed overall file hash
+        // Now decoding should fail (hash mismatch or assembly problems)
         let err = super::decode_image_to_file(&forged).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("hash mismatch") || msg.contains("missing chunks") || msg.contains("assembled file hash mismatch"));
+        assert!(
+            msg.contains("hash mismatch") ||
+            msg.contains("missing chunks") ||
+            msg.contains("assembled file hash mismatch"),
+            "unexpected error: {msg}"
+        );
         Ok(())
     }
 }
