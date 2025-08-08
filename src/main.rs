@@ -781,83 +781,122 @@ mod tests {
 
     #[test]
     fn tamper_detection_via_hash_mismatch() -> Result<()> {
-        use image::Pixel;
-    
+        // 1) Encode a small payload
         let dir = tempdir()?;
         let input = dir.path().join("secret.bin");
         fs::write(&input, b"THIS IS A SECRET PAYLOAD")?;
         let out_png = super::encode_file_to_png(&input)?;
     
-        // --- Determine the exact sampling geometry so we can flip a real data bit ---
+        // 2) Load original PNG and compute geometry on the real threshold
         let dynimg = image::open(&out_png)?;
         let gray = dynimg.to_luma8();
         let thr = super::otsu_threshold(&gray);
         let bin = super::binarize(&gray, thr);
         let geom = super::try_infer_geometry(&bin, thr)?;
     
-        // Helper: sample the bit the same way the decoder does (center of the cell).
-        let sample_center_bit = |r: u32, c: u32| -> u8 {
-            let center_off = geom.cell_px / 2;
-            let cx = (geom.origin_x + c * geom.cell_px + center_off).min(bin.width() - 1) as usize;
-            let cy = (geom.origin_y + r * geom.cell_px + center_off).min(bin.height() - 1) as usize;
-            let w = bin.width() as usize;
-            let v = bin.as_raw()[cy * w + cx];
-            if v < 128 { 1 } else { 0 }
+        // 3) Sample the entire bitstream from the original image (exactly as decoder does)
+        let center_off = geom.cell_px / 2;
+        let raw = bin.as_raw();
+        let w = bin.width() as usize;
+    
+        let mut bits = Vec::with_capacity((geom.grid_w * geom.grid_h) as usize);
+        for r in 0..geom.grid_h {
+            for c in 0..geom.grid_w {
+                let cx = (geom.origin_x + c * geom.cell_px + center_off).min(bin.width() - 1) as usize;
+                let cy = (geom.origin_y + r * geom.cell_px + center_off).min(bin.height() - 1) as usize;
+                let v = raw[cy * w + cx];
+                bits.push(if v < 128 { 1 } else { 0 });
+            }
+        }
+        let stream = super::bits_to_bytes(&bits);
+    
+        // 4) Parse headers to find the payload start (bytes)
+        //    MAGIC (4) + VERSION (2) + [len(4)+header]*HEADER_REPEAT + payload + trailer(4)
+        assert!(stream.len() >= 6, "stream too short to contain MAGIC+VERSION");
+        assert_eq!(&stream[0..4], super::MAGIC, "unexpected MAGIC");
+        let ver = u16::from_le_bytes([stream[4], stream[5]]);
+        assert_eq!(ver, super::VERSION, "unexpected VERSION");
+    
+        let mut cursor = 6usize;
+        let mut hdr: Option<super::Header> = None;
+        for i in 0..super::HEADER_REPEAT {
+            assert!(cursor + 4 <= stream.len(), "missing header[{}] len at {}", i, cursor);
+            let len = u32::from_le_bytes([stream[cursor], stream[cursor+1], stream[cursor+2], stream[cursor+3]]) as usize;
+            cursor += 4;
+            assert!(cursor + len <= stream.len(), "header[{}] truncated at {}", i, cursor);
+            let (h, rest) = postcard::take_from_bytes::<super::Header>(&stream[cursor..cursor+len])
+                .map_err(|e| anyhow!("postcard decode header[{}]: {}", i, e))?;
+            assert!(rest.is_empty(), "header[{}] had trailing {} bytes", i, rest.len());
+            hdr = Some(h);
+            cursor += len;
+        }
+        let hdr = hdr.expect("header missing after repeats");
+        let payload_start_bytes = cursor;
+        let payload_len_bytes = hdr.payload_len as usize;
+    
+        // Sanity: payload range must fit the stream
+        assert!(payload_start_bytes + payload_len_bytes + 4 <= stream.len(), "payload/trailer OOB");
+    
+        // 5) Choose a payload bit (middle of payload) and map to cell (row, col)
+        let payload_start_bits = payload_start_bytes * 8;
+        let payload_bits = payload_len_bytes * 8;
+        let target_bit = payload_start_bits + payload_bits / 2; // safely inside payload
+        let target_r = (target_bit as u32) / geom.grid_w;
+        let target_c = (target_bit as u32) % geom.grid_w;
+    
+        // 6) Determine original bit at that cell (under current threshold)
+        let cell_cx = geom.origin_x + target_c * geom.cell_px + center_off;
+        let cell_cy = geom.origin_y + target_r * geom.cell_px + center_off;
+        let orig_bit = {
+            let px = bin.as_raw()[(cell_cy as usize) * w + (cell_cx as usize)];
+            if px < 128 { 1 } else { 0 }
         };
     
-        // Pick a deterministic cell inside the grid (top-left corner cell).
-        let target_r = 0u32.min(geom.grid_h - 1);
-        let target_c = 0u32.min(geom.grid_w - 1);
-        let before_bit = sample_center_bit(target_r, target_c);
-    
-        // Compute the exact center pixel (in color image space) to paint over.
-        let center_off = geom.cell_px / 2;
-        let cx = (geom.origin_x + target_c * geom.cell_px + center_off) as i64;
-        let cy = (geom.origin_y + target_r * geom.cell_px + center_off) as i64;
-    
-        // Paint a small square around the center with the OPPOSITE color:
-        // if the bit was black(1), paint white(255); if white(0), paint black(0).
-        let mut img = dynimg.to_rgba8();
-        let paint_white = before_bit == 1;
-        let paint_color = if paint_white { Rgba([255, 255, 255, 255]) } else { Rgba([0, 0, 0, 255]) };
-    
-        // Use a small square centered at (cx, cy); width ~ cell_px/3 (min 3px).
-        let half = std::cmp::max(1, (geom.cell_px / 3).max(3) / 2) as i64;
-        let x0 = (cx - half).max(0) as u32;
-        let y0 = (cy - half).max(0) as u32;
-        let x1 = ((cx + half) as u32).min(img.width() - 1);
-        let y1 = ((cy + half) as u32).min(img.height() - 1);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                img.put_pixel(x, y, paint_color);
+        // 7) Forge the image by repainting the ENTIRE target cell to the opposite color
+        let mut forged = dynimg.to_rgba8();
+        let paint_white = orig_bit == 1;
+        let paint = if paint_white { Rgba([255,255,255,255]) } else { Rgba([0,0,0,255]) };
+        let x0 = geom.origin_x + target_c * geom.cell_px;
+        let y0 = geom.origin_y + target_r * geom.cell_px;
+        for y in y0..(y0 + geom.cell_px) {
+            for x in x0..(x0 + geom.cell_px) {
+                forged.put_pixel(x, y, paint);
             }
         }
     
-        // Sanity: after painting, the sampled bit must be flipped.
-        let forged_gray = DynamicImage::ImageRgba8(img.clone()).to_luma8();
-        let forged_bin = super::binarize(&forged_gray, thr); // same threshold used earlier
+        // 8) Confirm the flip still reads as flipped under the decoder's (recomputed) threshold
+        let forged_gray = DynamicImage::ImageRgba8(forged.clone()).to_luma8();
+        let forged_thr = super::otsu_threshold(&forged_gray);
+        let forged_bin = super::binarize(&forged_gray, forged_thr);
+        let w2 = forged_bin.width() as usize;
         let flipped_bit = {
-            let w = forged_bin.width() as usize;
-            let cxu = cx as usize;
-            let cyu = cy as usize;
-            let v = forged_bin.as_raw()[cyu * w + cxu];
+            let cx = (x0 + center_off) as usize;
+            let cy = (y0 + center_off) as usize;
+            let v = forged_bin.as_raw()[cy * w2 + cx];
             if v < 128 { 1 } else { 0 }
         };
-        assert_ne!(before_bit, flipped_bit, "tamper did not flip the sampled bit");
+        assert_ne!(orig_bit, flipped_bit, "tamper did not flip the sampled bit under decoder threshold");
     
-        // Write the forged PNG and expect decode to fail with integrity errors.
-        let forged = out_png.with_file_name("forged.png");
-        DynamicImage::ImageRgba8(img).save(&forged)?;
+        // 9) Save forged image and require decode failure with an integrity-specific reason
+        let forged_path = out_png.with_file_name("forged.png");
+        DynamicImage::ImageRgba8(forged).save(&forged_path)?;
     
-        let err = super::decode_png_to_bytes(&forged).unwrap_err();
+        let err = super::decode_png_to_bytes(&forged_path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Trailer u32 mismatch")
-                || msg.contains("Assembled payload BLAKE3 mismatch")
-                || msg.contains("All threshold attempts failed")
-                || msg.contains("Geometry inference failed"),
+            // payload integrity checks
+            msg.contains("Assembled payload BLAKE3 mismatch")
+            // header/parse checks (OK too, but less likely since we hit payload)
+            || msg.contains("Trailer u32 mismatch")
+            || msg.contains("Header repeat mismatch")
+            || msg.contains("Magic mismatch")
+            || msg.contains("Payload/trailer out of bounds")
+            // geometry/threshold failure (shouldn't happen with single-cell flip, but accept)
+            || msg.contains("Geometry inference failed")
+            || msg.contains("All threshold attempts failed"),
             "unexpected error detail: {msg}"
         );
+    
         Ok(())
     }
 
