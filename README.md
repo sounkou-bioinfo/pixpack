@@ -1,82 +1,35 @@
 # pixpack
 
-Pack **any file** into a **viewable PNG**, and unpack it back to the **exact same bytes** — in one command, with **cryptographic proof**.
+Turn **any file into a single PNG** whose **pixels carry the data**. Feed that PNG back in to **recover the exact original** with strong integrity checks.
 
-* **One arg only:** if the path is a PNG (by signature) → **decode**; otherwise → **encode**.
-* **Viewable output:** writes a tiny 8×8 gradient PNG; your data lives in a private ancillary chunk.
-* **Integrity first:** stores length + **BLAKE3** in a header and **re-verifies** after every write.
-
----
-
-## Install
+# Install
 
 ```bash
 cargo install pixpack
 ```
 
----
-
-## Usage
-
-**Encode (file → PNG):**
+# Use
 
 ```bash
-pixpack file.txt
+# encode (file → PNG)
+pixpack myfile.bin        # creates myfile.bin.png
+
+# decode (PNG → file)
+pixpack myfile.bin.png    # recreates myfile.bin
 ```
 
-**Decode (PNG → file):**
+One argument only. If it’s a PNG, pixpack decodes; otherwise it encodes.
 
-```bash
-pixpack file.png
-```
+# Info
 
-Behavior on conflicts:
+* Renders a **macro-cell grid** with a **white quiet zone** and **black frame**.
+* Packs: `MAGIC | VERSION | header (×2) | payload | trailer_u32`.
 
-* If `file.ext` **exists** and **matches** the embedded length+hash → **no write** (idempotent).
-* If it **differs** → write `file.ext.restored`.
+  * **Header**: filename, total length, full BLAKE3, grid hints.
+  * **Trailer**: first 4 bytes of BLAKE3(payload) for a fast sanity check.
+* **Decode**: grayscale → Otsu threshold (with a few fallbacks) → infer frame/quiet → sample **center pixel per cell** → rebuild stream.
+* **Integrity**:
 
----
-
-## How it works (short)
-
-* Payload is stored in PNG **ancillary chunk** `ruSt`.
-* Chunk data = **postcard** header (magic, version, original name, length, BLAKE3) + raw bytes.
-* Encode path: write PNG → re-open → parse chunk → verify length/hash and **byte-for-byte equality**.
-* Decode path: verify PNG decodes, parse chunk, verify, write file, **rehash** file.
-
----
-
-## Guarantees
-
-* **Lossless round-trip** (length + BLAKE3 match).
-* **Actively proven** after every write.
-* PNG remains **100% viewable** in normal image viewers.
-
----
-
-## Caveats
-
-* **Not encrypted/hidden.** Anyone can inspect chunks.
-* Some tools/services **strip ancillary chunks** → don’t run optimized/stripping pipelines on encoded PNGs.
-* Embedding currently loads payload into memory (very large files may not be ideal).
-
----
-
-## Quick examples
-
-```bash
-# Pack a config
-echo "data=42" > app.conf
-pixpack app.conf            # -> app.conf.png
-pixpack app.conf.png        # -> app.conf (same bytes)
-
-# Idempotent decode
-pixpack artifact.bin.png    # writes artifact.bin
-pixpack artifact.bin.png    # detects match; no duplicate
-```
-
----
-
-That’s it — **pack** with confidence, **unpack** with proof.
-
-(Co-written with GPT-5.)
+  * Encode: re-open the written PNG, decode it back, verify **length + full BLAKE3 + byte-for-byte**.
+  * Decode: after writing the file, re-hash and verify **length + full BLAKE3** again.
+* Capacity is **1 bit per data cell**; pixpack picks a near-square grid and a cell size capped by a max canvas side.
