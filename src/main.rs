@@ -781,26 +781,83 @@ mod tests {
 
     #[test]
     fn tamper_detection_via_hash_mismatch() -> Result<()> {
+        use image::Pixel;
+    
         let dir = tempdir()?;
         let input = dir.path().join("secret.bin");
         fs::write(&input, b"THIS IS A SECRET PAYLOAD")?;
         let out_png = super::encode_file_to_png(&input)?;
-
-        // Corrupt: draw a white stripe through data region
-        let mut img = image::open(&out_png)?.to_rgba8();
-        let w = img.width();
-        for y in 0..img.height() {
-            for x in (w/3)..(w/3 + 4) { img.put_pixel(x, y, Rgba([255,255,255,255])); }
+    
+        // --- Determine the exact sampling geometry so we can flip a real data bit ---
+        let dynimg = image::open(&out_png)?;
+        let gray = dynimg.to_luma8();
+        let thr = super::otsu_threshold(&gray);
+        let bin = super::binarize(&gray, thr);
+        let geom = super::try_infer_geometry(&bin, thr)?;
+    
+        // Helper: sample the bit the same way the decoder does (center of the cell).
+        let sample_center_bit = |r: u32, c: u32| -> u8 {
+            let center_off = geom.cell_px / 2;
+            let cx = (geom.origin_x + c * geom.cell_px + center_off).min(bin.width() - 1) as usize;
+            let cy = (geom.origin_y + r * geom.cell_px + center_off).min(bin.height() - 1) as usize;
+            let w = bin.width() as usize;
+            let v = bin.as_raw()[cy * w + cx];
+            if v < 128 { 1 } else { 0 }
+        };
+    
+        // Pick a deterministic cell inside the grid (top-left corner cell).
+        let target_r = 0u32.min(geom.grid_h - 1);
+        let target_c = 0u32.min(geom.grid_w - 1);
+        let before_bit = sample_center_bit(target_r, target_c);
+    
+        // Compute the exact center pixel (in color image space) to paint over.
+        let center_off = geom.cell_px / 2;
+        let cx = (geom.origin_x + target_c * geom.cell_px + center_off) as i64;
+        let cy = (geom.origin_y + target_r * geom.cell_px + center_off) as i64;
+    
+        // Paint a small square around the center with the OPPOSITE color:
+        // if the bit was black(1), paint white(255); if white(0), paint black(0).
+        let mut img = dynimg.to_rgba8();
+        let paint_white = before_bit == 1;
+        let paint_color = if paint_white { Rgba([255, 255, 255, 255]) } else { Rgba([0, 0, 0, 255]) };
+    
+        // Use a small square centered at (cx, cy); width ~ cell_px/3 (min 3px).
+        let half = std::cmp::max(1, (geom.cell_px / 3).max(3) / 2) as i64;
+        let x0 = (cx - half).max(0) as u32;
+        let y0 = (cy - half).max(0) as u32;
+        let x1 = ((cx + half) as u32).min(img.width() - 1);
+        let y1 = ((cy + half) as u32).min(img.height() - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                img.put_pixel(x, y, paint_color);
+            }
         }
+    
+        // Sanity: after painting, the sampled bit must be flipped.
+        let forged_gray = DynamicImage::ImageRgba8(img.clone()).to_luma8();
+        let forged_bin = super::binarize(&forged_gray, thr); // same threshold used earlier
+        let flipped_bit = {
+            let w = forged_bin.width() as usize;
+            let cxu = cx as usize;
+            let cyu = cy as usize;
+            let v = forged_bin.as_raw()[cyu * w + cxu];
+            if v < 128 { 1 } else { 0 }
+        };
+        assert_ne!(before_bit, flipped_bit, "tamper did not flip the sampled bit");
+    
+        // Write the forged PNG and expect decode to fail with integrity errors.
         let forged = out_png.with_file_name("forged.png");
         DynamicImage::ImageRgba8(img).save(&forged)?;
-
+    
         let err = super::decode_png_to_bytes(&forged).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("Trailer u32 mismatch")
-            || msg.contains("Assembled payload BLAKE3 mismatch")
-            || msg.contains("All threshold attempts failed")
-            || msg.contains("Geometry inference failed"), "unexpected error detail: {msg}");
+        assert!(
+            msg.contains("Trailer u32 mismatch")
+                || msg.contains("Assembled payload BLAKE3 mismatch")
+                || msg.contains("All threshold attempts failed")
+                || msg.contains("Geometry inference failed"),
+            "unexpected error detail: {msg}"
+        );
         Ok(())
     }
 
