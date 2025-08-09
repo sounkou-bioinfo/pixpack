@@ -37,68 +37,24 @@ NULL
   stop(class, " cannot be modified", call. = FALSE)
 }
 
-#' Multiply Input By Another Input
+#' Encode a string into a PixPack PNG at given path or decode an existing PixPack PNG to string.
+#' If `png_path` already exists and is a PixPack PNG, it is decoded; otherwise `input` is encoded to that PNG path.
 #'
-#' @param x An integer vector.
-#' @param y An integer to multiply.
-#' @returns An integer vector with values multiplied by `y`.
+#' @param input Character scalar (content when encoding; ignored on decode).
+#' @param png_path Target PNG path (must be provided).
+#' @return On encode: PNG path; On decode: decoded UTF-8 string (lossy).
 #' @export
-`int_times_int` <- function(`x`, `y`) {
-  .Call(savvy_int_times_int__impl, `x`, `y`)
+`StringConversion` <- function(`input`, `png_path`) {
+  .Call(savvy_StringConversion__impl, `input`, `png_path`)
 }
 
-#' Convert Input To Upper-Case
+#' Encode a file to PixPack PNG or decode a PixPack PNG back to original file.
 #'
-#' @param x A character vector.
-#' @returns A character vector with upper case version of the input.
+#' @param path Input file path (character scalar).
+#' @return Output artifact path (character scalar).
 #' @export
-`to_upper` <- function(`x`) {
-  .Call(savvy_to_upper__impl, `x`)
+`fileConversion` <- function(`path`) {
+  .Call(savvy_fileConversion__impl, `path`)
 }
 
-### wrapper functions for Person
-
-`Person_name` <- function(self) {
-  function() {
-    .Call(savvy_Person_name__impl, `self`)
-  }
-}
-
-`Person_set_name` <- function(self) {
-  function(`name`) {
-    invisible(.Call(savvy_Person_set_name__impl, `self`, `name`))
-  }
-}
-
-`.savvy_wrap_Person` <- function(ptr) {
-  e <- new.env(parent = emptyenv())
-  e$.ptr <- ptr
-  e$`name` <- `Person_name`(ptr)
-  e$`set_name` <- `Person_set_name`(ptr)
-
-  class(e) <- c("Person", "savvy_Rpixpack__sealed")
-  e
-}
-
-
-
-`Person` <- new.env(parent = emptyenv())
-
-### associated functions for Person
-
-`Person`$`associated_function` <- function() {
-  .Call(savvy_Person_associated_function__impl)
-}
-
-`Person`$`new` <- function() {
-  .savvy_wrap_Person(.Call(savvy_Person_new__impl))
-}
-
-
-class(`Person`) <- c("Person__bundle", "savvy_Rpixpack__sealed")
-
-#' @export
-`print.Person__bundle` <- function(x, ...) {
-  cat('Person\n')
-}
 

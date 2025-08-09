@@ -2,7 +2,6 @@
 
 S3method("$<-",savvy_Rpixpack__sealed)
 S3method("[[<-",savvy_Rpixpack__sealed)
-S3method(print,Person__bundle)
-export(int_times_int)
-export(to_upper)
+export(StringConversion)
+export(fileConversion)
 useDynLib(Rpixpack, .registration = TRUE)
