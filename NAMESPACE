@@ -2,6 +2,11 @@
 
 S3method("$<-",savvy_Rpixpack__sealed)
 S3method("[[<-",savvy_Rpixpack__sealed)
+S3method(print,pixpack_info)
 export(StringConversion)
 export(fileConversion)
+export(pixpack_convert)
+export(pixpack_info)
+export(pixpack_plot)
+export(pixpack_text)
 useDynLib(Rpixpack, .registration = TRUE)
