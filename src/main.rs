@@ -24,7 +24,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use blake3::Hasher;
-use image::{imageops, DynamicImage, GrayImage, ImageBuffer, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, ImageBuffer, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 
 // ========================= Configuration =========================
@@ -718,6 +718,7 @@ fn real_main() -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use image::imageops;
 
     fn xorshift64(seed: &mut u64) -> u64 { let mut x=*seed; x^=x<<13; x^=x>>7; x^=x<<17; *seed=x; x }
     fn gen_bytes(len: usize, mut seed: u64) -> Vec<u8> {
