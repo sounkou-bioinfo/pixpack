@@ -3,6 +3,17 @@ name = "pixpack"
 version = "0.1.0"
 edition = "2024"
 
+description = "File visual encoding: pack any file into a PNG cell grid with BLAKE3 integrity, and decode it back byte-for-byte."
+license = "MIT"
+
+readme = "README.md"
+keywords = ["png", "encoding", "blake3", "qrcode", "cli"]
+categories = ["encoding", "multimedia::images", "command-line-utilities"]
+repository = "https://github.com/SauersML/pixpack"
+documentation = "https://github.com/SauersML/pixpack"
+
+default-run = "pixpack"
+
 [dependencies]
 anyhow = "1"
 blake3 = "1.8"
