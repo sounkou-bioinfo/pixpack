@@ -154,7 +154,7 @@ fn otsu_threshold(gray: &GrayImage) -> u8 {
 }
 fn binarize(gray: &GrayImage, t: u8) -> GrayImage {
     let mut out = gray.clone();
-    for p in out.pixels_mut() { p.0[0] = if p.0[0] >= t { 255 } else { 0 }; }
+    for p in out.pixels_mut() { p.0[0] = if p.0[0] > t { 255 } else { 0 }; }
     out
 }
 
