@@ -22,8 +22,7 @@ This package provides R bindings for the excellent [PixPack](https://github.com/
 You'll need Rust installed on your system. Install from [rustup.rs](https://rustup.rs/).
 
 ```r
-# Install from source (development version)
-devtools::install_github("sounkou-bioinfo/pixpack", subdir = ".", ref = "Rpixpack")
+install.packages('Rpixpack', repos = c('https://sounkou-bioinfo.r-universe.dev', 'https://cloud.r-project.org'))
 ```
 
 ## Quick Start

@@ -15,8 +15,7 @@ You’ll need Rust installed on your system. Install from
 [rustup.rs](https://rustup.rs/).
 
 ``` r
-# Install from source (development version)
-devtools::install_github("sounkou-bioinfo/pixpack", subdir = ".", ref = "Rpixpack")
+install.packages('Rpixpack', repos = c('https://sounkou-bioinfo.r-universe.dev', 'https://cloud.r-project.org'))
 ```
 
 ## Quick Start
@@ -32,9 +31,9 @@ library(Rpixpack)
 png_file <- tempfile(fileext = ".png")
 result <- pixpack_text("Hello, PixPack from R! 🚀📊", png_file)
 #> Encoding text to PNG...
-#> Created PNG: /tmp/RtmpxVuzpM/file1c3673b22b899.png
+#> Created PNG: /tmp/RtmpLBTRaT/file1d2d3720bc3ff.png
 cat("Created PNG:", result, "\n")
-#> Created PNG: /tmp/RtmpxVuzpM/file1c3673b22b899.png
+#> Created PNG: /tmp/RtmpLBTRaT/file1d2d3720bc3ff.png
 
 # Decode PNG back to text
 decoded <- pixpack_text(png_path = png_file)
@@ -47,10 +46,10 @@ cat("Decoded text:", decoded, "\n")
 info <- pixpack_info(png_file)
 print(info)
 #> PixPack File Info:
-#>   File: file1c3673b22b899.png 
-#>   Size: 26.28 KB
+#>   File: file1d2d3720bc3ff.png 
+#>   Size: 26.27 KB
 #>   Type: Possibly PixPack PNG (use pixpack_plot for visualization) 
-#>   Modified: 2025-08-09 21:44:17
+#>   Modified: 2025-08-09 21:52:00
 ```
 
 ### File Encoding Example
@@ -70,12 +69,12 @@ writeLines(test_content, test_file)
 # Encode file to PNG
 png_result <- pixpack_convert(test_file, verbose = TRUE)
 #> Encoding file to PNG...
-#> Output: /tmp/RtmpxVuzpM/file1c36712b76133.txt.png
+#> Output: /tmp/RtmpLBTRaT/file1d2d362f1fb0c.txt.png
 
 # Decode PNG back to original file
 decoded_file <- pixpack_convert(png_result, verbose = TRUE)
 #> Decoding PNG to original file...
-#> Output: /tmp/RtmpxVuzpM/file1c36712b76133.txt
+#> Output: /tmp/RtmpLBTRaT/file1d2d362f1fb0c.txt
 
 # Verify the content is preserved
 original_content <- readLines(test_file)
