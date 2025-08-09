@@ -1,3 +1,5 @@
+library(Rpixpack)
+library(tinytest)
 # Test basic pixpack functionality
 
 # Test string roundtrip

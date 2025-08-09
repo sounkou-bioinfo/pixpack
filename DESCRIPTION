@@ -1,11 +1,23 @@
 Package: Rpixpack
-Title: What the Package Does (One Line, Title Case)
-Version: 0.0.0.9000
-Authors@R: 
-    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
-Description: What the package does (one paragraph).
+Title: R Bindings for PixPack - Encode Files into PNG Images
+Version: 0.1.0
+Authors@R: c(
+    person("SauersML", role = "aut", 
+           comment = "Original PixPack author"),
+    person("Claude", "Sonnet", role = c("aut", "cre"),
+           email = "claude@anthropic.com",
+           comment = "R bindings implementation")
+    )
+Description: R bindings for PixPack, a utility that encodes arbitrary files and 
+    strings into PNG images with strong integrity checks using BLAKE3 hashing.
+    Files can be encoded into visually distinctive PNG images and decoded back 
+    to recover the exact original data byte-for-byte. The underlying PixPack 
+    implementation uses a macro-cell grid format with error detection capabilities.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.2
 SystemRequirements: Cargo (Rust's package manager), rustc
+Suggests: 
+    png,
+    tinytest
