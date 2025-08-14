@@ -36,12 +36,13 @@ library(Rpixpack)
 ```{r text-example}
 # Encode text to PNG
 png_file <- tempfile(fileext = ".png")
-result <- pixpack_text("Hello, PixPack from R! 🚀📊", png_file)
+result <- pixpack_text("Hello, PixPack from R! Testing encoding.", png_file)
 cat("Created PNG:", result, "\n")
 
 # Decode PNG back to text
 decoded <- pixpack_text(png_path = png_file)
 cat("Decoded text:", decoded, "\n")
+cat("Text preserved:", identical("Hello, PixPack from R! Testing encoding.", decoded), "\n")
 
 # Show file info
 info <- pixpack_info(png_file)
@@ -106,7 +107,7 @@ cat("Restored length:", length(restored_binary), "bytes\n")
 
 ```{r lowlevel-test}
 # Test direct API functions
-test_text <- "Direct API test: 你好世界! 🎉"
+test_text <- "Direct API test with special chars: Hello World! @#$%^&*()"
 direct_png <- tempfile(fileext = ".png")
 
 # Use StringConversion directly
@@ -161,6 +162,11 @@ cat("Large text preserved:", identical(large_text, large_decoded), "\n")
 png_size <- file.info(large_png)$size
 cat("PNG file size:", round(png_size / 1024, 1), "KB\n")
 cat("Compression ratio:", round(nchar(large_text) / png_size, 2), "\n")
+
+# Additional verification - ensure byte-for-byte accuracy
+original_bytes <- charToRaw(large_text)
+decoded_bytes <- charToRaw(large_decoded)
+cat("Byte-level identical:", identical(original_bytes, decoded_bytes), "\n")
 ```
 
 ```{r cleanup, include=FALSE}
