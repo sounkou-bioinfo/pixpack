@@ -31,9 +31,9 @@ library(Rpixpack)
 png_file <- tempfile(fileext = ".png")
 result <- pixpack_text("Hello, PixPack from R! 🚀📊", png_file)
 #> Encoding text to PNG...
-#> Created PNG: /tmp/Rtmpius6Fl/file7ac62cbe57ac.png
+#> Created PNG: /tmp/Rtmpv2sDqC/file962a76aa040f.png
 cat("Created PNG:", result, "\n")
-#> Created PNG: /tmp/Rtmpius6Fl/file7ac62cbe57ac.png
+#> Created PNG: /tmp/Rtmpv2sDqC/file962a76aa040f.png
 
 # Decode PNG back to text
 decoded <- pixpack_text(png_path = png_file)
@@ -46,10 +46,10 @@ cat("Decoded text:", decoded, "\n")
 info <- pixpack_info(png_file)
 print(info)
 #> PixPack File Info:
-#>   File: file7ac62cbe57ac.png 
-#>   Size: 26.22 KB
+#>   File: file962a76aa040f.png 
+#>   Size: 26.28 KB
 #>   Type: Possibly PixPack PNG (use pixpack_plot for visualization) 
-#>   Modified: 2025-08-14 19:56:56
+#>   Modified: 2025-08-14 20:01:42
 ```
 
 ### File Encoding Example
@@ -69,12 +69,12 @@ writeLines(test_content, test_file)
 # Encode file to PNG
 png_result <- pixpack_convert(test_file, verbose = TRUE)
 #> Encoding file to PNG...
-#> Output: /tmp/Rtmpius6Fl/file7ac630c7fa5e.txt.png
+#> Output: /tmp/Rtmpv2sDqC/file962a52c4c02b.txt.png
 
 # Decode PNG back to original file
 decoded_file <- pixpack_convert(png_result, verbose = TRUE)
 #> Decoding PNG to original file...
-#> Output: /tmp/Rtmpius6Fl/file7ac630c7fa5e.txt
+#> Output: /tmp/Rtmpv2sDqC/file962a52c4c02b.txt
 
 # Verify the content is preserved
 original_content <- readLines(test_file)
@@ -105,12 +105,12 @@ writeBin(binary_data, binary_file)
 # Encode binary file
 png_binary <- pixpack_convert(binary_file, verbose = TRUE)
 #> Encoding file to PNG...
-#> Output: /tmp/Rtmpius6Fl/file7ac6eebd60.bin.png
+#> Output: /tmp/Rtmpv2sDqC/file962a7b8f0bef.bin.png
 
 # Decode and verify
 decoded_binary <- pixpack_convert(png_binary, verbose = TRUE)
 #> Decoding PNG to original file...
-#> Output: /tmp/Rtmpius6Fl/file7ac6eebd60.bin
+#> Output: /tmp/Rtmpv2sDqC/file962a7b8f0bef.bin
 original_binary <- readBin(binary_file, "raw", n = length(binary_data))
 restored_binary <- readBin(decoded_binary, "raw", n = length(binary_data))
 
@@ -132,7 +132,7 @@ direct_png <- tempfile(fileext = ".png")
 # Use StringConversion directly
 result_path <- StringConversion(test_text, direct_png)
 cat("StringConversion result:", result_path, "\n")
-#> StringConversion result: /tmp/Rtmpius6Fl/file7ac632780a33.png
+#> StringConversion result: /tmp/Rtmpv2sDqC/file962a666a8030.png
 
 # Decode using StringConversion
 decoded_text <- StringConversion("", direct_png)
@@ -147,12 +147,12 @@ writeLines(c("# Test Document", "This is a test.", "Line 3"), test_doc)
 
 direct_png2 <- fileConversion(test_doc)
 cat("fileConversion created:", direct_png2, "\n")
-#> fileConversion created: /tmp/Rtmpius6Fl/file7ac670d1ee2d.txt.png
+#> fileConversion created: /tmp/Rtmpv2sDqC/file962a4fd0371d.txt.png
 
 # Decode back
 restored_doc <- fileConversion(direct_png2)
 cat("fileConversion restored:", restored_doc, "\n")
-#> fileConversion restored: /tmp/Rtmpius6Fl/file7ac670d1ee2d.txt
+#> fileConversion restored: /tmp/Rtmpv2sDqC/file962a4fd0371d.txt
 
 # Verify content
 original_lines <- readLines(test_doc)
@@ -172,7 +172,7 @@ large_png <- tempfile(fileext = ".png")
 start_time <- Sys.time()
 large_result <- pixpack_text(large_text, large_png, verbose = TRUE)
 #> Encoding text to PNG...
-#> Created PNG: /tmp/Rtmpius6Fl/file7ac66ed7b39f.png
+#> Created PNG: /tmp/Rtmpv2sDqC/file962a6b5aafd1.png
 encode_time <- Sys.time() - start_time
 
 # Measure decoding time
@@ -185,9 +185,9 @@ decode_time <- Sys.time() - start_time
 cat("Large text length:", nchar(large_text), "characters\n")
 #> Large text length: 2900 characters
 cat("Encoding time:", round(as.numeric(encode_time, units = "secs"), 3), "seconds\n")
-#> Encoding time: 23.697 seconds
+#> Encoding time: 0.33 seconds
 cat("Decoding time:", round(as.numeric(decode_time, units = "secs"), 3), "seconds\n")
-#> Decoding time: 8.654 seconds
+#> Decoding time: 0.172 seconds
 cat("Large text preserved:", identical(large_text, large_decoded), "\n")
 #> Large text preserved: TRUE
 
