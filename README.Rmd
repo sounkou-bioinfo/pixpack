@@ -36,13 +36,13 @@ library(Rpixpack)
 ```{r text-example}
 # Encode text to PNG
 png_file <- tempfile(fileext = ".png")
-result <- pixpack_text("Hello, PixPack from R! Testing encoding.", png_file)
+result <- pixpack_text("Hello, PixPack from R! 🚀📊", png_file)
 cat("Created PNG:", result, "\n")
 
 # Decode PNG back to text
 decoded <- pixpack_text(png_path = png_file)
 cat("Decoded text:", decoded, "\n")
-cat("Text preserved:", identical("Hello, PixPack from R! Testing encoding.", decoded), "\n")
+cat("Text preserved:", identical("Hello, PixPack from R! 🚀📊", decoded), "\n")
 
 # Show file info
 info <- pixpack_info(png_file)

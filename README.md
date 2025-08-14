@@ -29,29 +29,29 @@ library(Rpixpack)
 ``` r
 # Encode text to PNG
 png_file <- tempfile(fileext = ".png")
-result <- pixpack_text("Hello, PixPack from R! Testing encoding.", png_file)
+result <- pixpack_text("Hello, PixPack from R! 🚀📊", png_file)
 #> Encoding text to PNG...
-#> Created PNG: /tmp/RtmpyRUImC/filea900407e753f.png
+#> Created PNG: /tmp/Rtmpg9eDU1/fileaed97c9ae70b.png
 cat("Created PNG:", result, "\n")
-#> Created PNG: /tmp/RtmpyRUImC/filea900407e753f.png
+#> Created PNG: /tmp/Rtmpg9eDU1/fileaed97c9ae70b.png
 
 # Decode PNG back to text
 decoded <- pixpack_text(png_path = png_file)
 #> Decoding PNG to text...
-#> Decoded 40 characters
+#> Decoded 25 characters
 cat("Decoded text:", decoded, "\n")
-#> Decoded text: Hello, PixPack from R! Testing encoding.
-cat("Text preserved:", identical("Hello, PixPack from R! Testing encoding.", decoded), "\n")
+#> Decoded text: Hello, PixPack from R! 🚀📊
+cat("Text preserved:", identical("Hello, PixPack from R! 🚀📊", decoded), "\n")
 #> Text preserved: TRUE
 
 # Show file info
 info <- pixpack_info(png_file)
 print(info)
 #> PixPack File Info:
-#>   File: filea900407e753f.png 
-#>   Size: 26.71 KB
+#>   File: fileaed97c9ae70b.png 
+#>   Size: 26.29 KB
 #>   Type: Possibly PixPack PNG (use pixpack_plot for visualization) 
-#>   Modified: 2025-08-14 20:08:01
+#>   Modified: 2025-08-14 20:09:51
 ```
 
 ### File Encoding Example
@@ -71,12 +71,12 @@ writeLines(test_content, test_file)
 # Encode file to PNG
 png_result <- pixpack_convert(test_file, verbose = TRUE)
 #> Encoding file to PNG...
-#> Output: /tmp/RtmpyRUImC/filea90053f1b7a6.txt.png
+#> Output: /tmp/Rtmpg9eDU1/fileaed91309fa7d.txt.png
 
 # Decode PNG back to original file
 decoded_file <- pixpack_convert(png_result, verbose = TRUE)
 #> Decoding PNG to original file...
-#> Output: /tmp/RtmpyRUImC/filea90053f1b7a6.txt
+#> Output: /tmp/Rtmpg9eDU1/fileaed91309fa7d.txt
 
 # Verify the content is preserved
 original_content <- readLines(test_file)
@@ -107,12 +107,12 @@ writeBin(binary_data, binary_file)
 # Encode binary file
 png_binary <- pixpack_convert(binary_file, verbose = TRUE)
 #> Encoding file to PNG...
-#> Output: /tmp/RtmpyRUImC/filea9005dfca97f.bin.png
+#> Output: /tmp/Rtmpg9eDU1/fileaed91f666812.bin.png
 
 # Decode and verify
 decoded_binary <- pixpack_convert(png_binary, verbose = TRUE)
 #> Decoding PNG to original file...
-#> Output: /tmp/RtmpyRUImC/filea9005dfca97f.bin
+#> Output: /tmp/Rtmpg9eDU1/fileaed91f666812.bin
 original_binary <- readBin(binary_file, "raw", n = length(binary_data))
 restored_binary <- readBin(decoded_binary, "raw", n = length(binary_data))
 
@@ -134,7 +134,7 @@ direct_png <- tempfile(fileext = ".png")
 # Use StringConversion directly
 result_path <- StringConversion(test_text, direct_png)
 cat("StringConversion result:", result_path, "\n")
-#> StringConversion result: /tmp/RtmpyRUImC/filea9002bad9874.png
+#> StringConversion result: /tmp/Rtmpg9eDU1/fileaed947960f7a.png
 
 # Decode using StringConversion
 decoded_text <- StringConversion("", direct_png)
@@ -149,12 +149,12 @@ writeLines(c("# Test Document", "This is a test.", "Line 3"), test_doc)
 
 direct_png2 <- fileConversion(test_doc)
 cat("fileConversion created:", direct_png2, "\n")
-#> fileConversion created: /tmp/RtmpyRUImC/filea9005446bc70.txt.png
+#> fileConversion created: /tmp/Rtmpg9eDU1/fileaed96bed8a47.txt.png
 
 # Decode back
 restored_doc <- fileConversion(direct_png2)
 cat("fileConversion restored:", restored_doc, "\n")
-#> fileConversion restored: /tmp/RtmpyRUImC/filea9005446bc70.txt
+#> fileConversion restored: /tmp/Rtmpg9eDU1/fileaed96bed8a47.txt
 
 # Verify content
 original_lines <- readLines(test_doc)
@@ -174,7 +174,7 @@ large_png <- tempfile(fileext = ".png")
 start_time <- Sys.time()
 large_result <- pixpack_text(large_text, large_png, verbose = TRUE)
 #> Encoding text to PNG...
-#> Created PNG: /tmp/RtmpyRUImC/filea900fe85e.png
+#> Created PNG: /tmp/Rtmpg9eDU1/fileaed93240be5a.png
 encode_time <- Sys.time() - start_time
 
 # Measure decoding time
@@ -187,9 +187,9 @@ decode_time <- Sys.time() - start_time
 cat("Large text length:", nchar(large_text), "characters\n")
 #> Large text length: 2900 characters
 cat("Encoding time:", round(as.numeric(encode_time, units = "secs"), 3), "seconds\n")
-#> Encoding time: 0.254 seconds
+#> Encoding time: 0.359 seconds
 cat("Decoding time:", round(as.numeric(decode_time, units = "secs"), 3), "seconds\n")
-#> Decoding time: 0.153 seconds
+#> Decoding time: 0.206 seconds
 cat("Large text preserved:", identical(large_text, large_decoded), "\n")
 #> Large text preserved: TRUE
 
