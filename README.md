@@ -31,9 +31,9 @@ library(Rpixpack)
 png_file <- tempfile(fileext = ".png")
 result <- pixpack_text("Hello, PixPack from R! 🚀📊", png_file)
 #> Encoding text to PNG...
-#> Created PNG: /tmp/RtmpLBTRaT/file1d2d3720bc3ff.png
+#> Created PNG: /tmp/Rtmpius6Fl/file7ac62cbe57ac.png
 cat("Created PNG:", result, "\n")
-#> Created PNG: /tmp/RtmpLBTRaT/file1d2d3720bc3ff.png
+#> Created PNG: /tmp/Rtmpius6Fl/file7ac62cbe57ac.png
 
 # Decode PNG back to text
 decoded <- pixpack_text(png_path = png_file)
@@ -46,10 +46,10 @@ cat("Decoded text:", decoded, "\n")
 info <- pixpack_info(png_file)
 print(info)
 #> PixPack File Info:
-#>   File: file1d2d3720bc3ff.png 
-#>   Size: 26.27 KB
+#>   File: file7ac62cbe57ac.png 
+#>   Size: 26.22 KB
 #>   Type: Possibly PixPack PNG (use pixpack_plot for visualization) 
-#>   Modified: 2025-08-09 21:52:00
+#>   Modified: 2025-08-14 19:56:56
 ```
 
 ### File Encoding Example
@@ -69,12 +69,12 @@ writeLines(test_content, test_file)
 # Encode file to PNG
 png_result <- pixpack_convert(test_file, verbose = TRUE)
 #> Encoding file to PNG...
-#> Output: /tmp/RtmpLBTRaT/file1d2d362f1fb0c.txt.png
+#> Output: /tmp/Rtmpius6Fl/file7ac630c7fa5e.txt.png
 
 # Decode PNG back to original file
 decoded_file <- pixpack_convert(png_result, verbose = TRUE)
 #> Decoding PNG to original file...
-#> Output: /tmp/RtmpLBTRaT/file1d2d362f1fb0c.txt
+#> Output: /tmp/Rtmpius6Fl/file7ac630c7fa5e.txt
 
 # Verify the content is preserved
 original_content <- readLines(test_file)
@@ -93,6 +93,111 @@ pixpack_plot(png_result, show_grid = TRUE)
 <img src="inst/doc/README-plot-example-1.png" width="100%" />
 
     #> PixPack PNG visualized. Dimensions: 1160x1140
+
+### Binary File Testing
+
+``` r
+# Test with binary data
+binary_data <- as.raw(c(0:255, 255:0, rep(42, 100)))
+binary_file <- tempfile(fileext = ".bin")
+writeBin(binary_data, binary_file)
+
+# Encode binary file
+png_binary <- pixpack_convert(binary_file, verbose = TRUE)
+#> Encoding file to PNG...
+#> Output: /tmp/Rtmpius6Fl/file7ac6eebd60.bin.png
+
+# Decode and verify
+decoded_binary <- pixpack_convert(png_binary, verbose = TRUE)
+#> Decoding PNG to original file...
+#> Output: /tmp/Rtmpius6Fl/file7ac6eebd60.bin
+original_binary <- readBin(binary_file, "raw", n = length(binary_data))
+restored_binary <- readBin(decoded_binary, "raw", n = length(binary_data))
+
+cat("Binary data preserved:", identical(original_binary, restored_binary), "\n")
+#> Binary data preserved: TRUE
+cat("Original length:", length(original_binary), "bytes\n")
+#> Original length: 612 bytes
+cat("Restored length:", length(restored_binary), "bytes\n")
+#> Restored length: 612 bytes
+```
+
+### Low-level API Testing
+
+``` r
+# Test direct API functions
+test_text <- "Direct API test: 你好世界! 🎉"
+direct_png <- tempfile(fileext = ".png")
+
+# Use StringConversion directly
+result_path <- StringConversion(test_text, direct_png)
+cat("StringConversion result:", result_path, "\n")
+#> StringConversion result: /tmp/Rtmpius6Fl/file7ac632780a33.png
+
+# Decode using StringConversion
+decoded_text <- StringConversion("", direct_png)
+cat("Decoded text:", decoded_text, "\n")
+#> Decoded text: Direct API test: 你好世界! 🎉
+cat("Roundtrip success:", identical(test_text, decoded_text), "\n")
+#> Roundtrip success: TRUE
+
+# Test fileConversion directly
+test_doc <- tempfile(fileext = ".txt")
+writeLines(c("# Test Document", "This is a test.", "Line 3"), test_doc)
+
+direct_png2 <- fileConversion(test_doc)
+cat("fileConversion created:", direct_png2, "\n")
+#> fileConversion created: /tmp/Rtmpius6Fl/file7ac670d1ee2d.txt.png
+
+# Decode back
+restored_doc <- fileConversion(direct_png2)
+cat("fileConversion restored:", restored_doc, "\n")
+#> fileConversion restored: /tmp/Rtmpius6Fl/file7ac670d1ee2d.txt
+
+# Verify content
+original_lines <- readLines(test_doc)
+restored_lines <- readLines(restored_doc)
+cat("File content preserved:", identical(original_lines, restored_lines), "\n")
+#> File content preserved: TRUE
+```
+
+### Large File Testing
+
+``` r
+# Test with larger content
+large_text <- paste(rep("This is a longer test string with more content to encode. ", 50), collapse = "")
+large_png <- tempfile(fileext = ".png")
+
+# Measure encoding time
+start_time <- Sys.time()
+large_result <- pixpack_text(large_text, large_png, verbose = TRUE)
+#> Encoding text to PNG...
+#> Created PNG: /tmp/Rtmpius6Fl/file7ac66ed7b39f.png
+encode_time <- Sys.time() - start_time
+
+# Measure decoding time
+start_time <- Sys.time()
+large_decoded <- pixpack_text(png_path = large_png, verbose = TRUE)
+#> Decoding PNG to text...
+#> Decoded 2900 characters
+decode_time <- Sys.time() - start_time
+
+cat("Large text length:", nchar(large_text), "characters\n")
+#> Large text length: 2900 characters
+cat("Encoding time:", round(as.numeric(encode_time, units = "secs"), 3), "seconds\n")
+#> Encoding time: 23.697 seconds
+cat("Decoding time:", round(as.numeric(decode_time, units = "secs"), 3), "seconds\n")
+#> Decoding time: 8.654 seconds
+cat("Large text preserved:", identical(large_text, large_decoded), "\n")
+#> Large text preserved: TRUE
+
+# Show file sizes
+png_size <- file.info(large_png)$size
+cat("PNG file size:", round(png_size / 1024, 1), "KB\n")
+#> PNG file size: 257.3 KB
+cat("Compression ratio:", round(nchar(large_text) / png_size, 2), "\n")
+#> Compression ratio: 0.01
+```
 
 ## Core Functions
 

@@ -24,7 +24,10 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use blake3::Hasher;
-use image::{DynamicImage, GrayImage, ImageBuffer, Rgba, RgbaImage};
+use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
+#[cfg(test)]
+use image::GrayImage;
+use png::{ColorType as PngColorType, Decoder as PngDecoder, Transformations as PngXform};
 use serde::{Deserialize, Serialize};
 
 // ========================= Configuration =========================
@@ -39,8 +42,8 @@ const FRAME_CELLS: u32 = 2;      // solid black frame thickness (in cells)
 
 // Encode-time sizing
 const MIN_CELL_PX: u32 = 6;      // smaller still decodes, but screenshot tolerance drops
-const MAX_CELL_PX: u32 = 20;     // bigger cells = larger image; clamp for sanity
-const MAX_SIDE_PX: u32 = 5000;   // cap longer canvas side
+const MAX_CELL_PX: u32 = 20;     // per-cell upper bound for aesthetics; not a payload/file-size limit
+const TARGET_SIDE_PX: u32 = 5000; // preferred canvas side (not enforced)
 
 // Header repeats for redundancy (same header back-to-back)
 const HEADER_REPEAT: usize = 2;
@@ -51,16 +54,11 @@ const FALLBACK_THRESHOLDS: &[u8] = &[200, 180, 160, 140, 120, 100];
 // Logging
 macro_rules! step { ($($arg:tt)*) => { eprintln!("▶ {}", format!($($arg)*)); }; }
 macro_rules! ok   { ($($arg:tt)*) => { eprintln!("✔ {}", format!($($arg)*)); }; }
-macro_rules! warn { ($($arg:tt)*) => { eprintln!("⚠ {}", format!($($arg)*)); }; }
 macro_rules! fail { ($($arg:tt)*) => { eprintln!("✘ {}", format!($($arg)*)); }; }
 
 // ========================= Types & integrity =========================
 
-#[derive(Debug, Clone)]
-struct UnverifiedBytes(Vec<u8>);
-#[derive(Debug, Clone)]
-struct VerifiedBytes(Vec<u8>);
-impl VerifiedBytes { fn as_slice(&self) -> &[u8] { &self.0 } }
+// (Removed unused VerifiedBytes helpers after switching to streaming verification)
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct Header {
@@ -95,16 +93,7 @@ fn blake3_hash_file(path: &Path) -> Result<([u8; 32], u64)> {
     }
     Ok((*h.finalize().as_bytes(), total))
 }
-fn verify_bytes(expected_len: u64, expected_hash: [u8; 32], data: UnverifiedBytes) -> Result<VerifiedBytes> {
-    if data.0.len() as u64 != expected_len {
-        bail!("Length mismatch: expected {}, got {}", expected_len, data.0.len());
-    }
-    let got = blake3_hash_bytes(&data.0);
-    if got != expected_hash {
-        bail!("BLAKE3 mismatch: expected {}, got {}", hex32(expected_hash), hex32(got));
-    }
-    Ok(VerifiedBytes(data.0))
-}
+// (Removed unused verify_bytes; streaming paths re-verify via BLAKE3 directly)
 fn hex32(bytes: [u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in bytes { use std::fmt::Write as _; let _ = write!(&mut s, "{:02x}", b); }
@@ -129,6 +118,7 @@ fn derive_dataset_id(bytes: &[u8], filename: &str) -> [u8; 16] {
 
 // ========================= Otsu & binarization =========================
 
+#[cfg(test)]
 fn otsu_threshold(gray: &GrayImage) -> u8 {
     let mut hist = [0u64; 256];
     for p in gray.pixels() { hist[p[0] as usize] += 1; }
@@ -152,6 +142,7 @@ fn otsu_threshold(gray: &GrayImage) -> u8 {
     }
     thresh
 }
+#[cfg(test)]
 fn binarize(gray: &GrayImage, t: u8) -> GrayImage {
     let mut out = gray.clone();
     for p in out.pixels_mut() { p.0[0] = if p.0[0] > t { 255 } else { 0 }; }
@@ -162,7 +153,6 @@ fn binarize(gray: &GrayImage, t: u8) -> GrayImage {
 
 #[derive(Debug, Clone)]
 struct Geometry {
-    threshold: u8,
     cell_px: u32,
     origin_x: u32, // top-left of data grid (in px)
     origin_y: u32,
@@ -170,14 +160,6 @@ struct Geometry {
     grid_h: u32,
     img_w: u32,
     img_h: u32,
-    quiet_left: u32,
-    frame_left_meas: u32,
-    quiet_right: u32,
-    frame_right_meas: u32,
-    quiet_top: u32,
-    frame_top_meas: u32,
-    quiet_bottom: u32,
-    frame_bottom_meas: u32,
 }
 
 fn scan_white_then_black(line: &[u8]) -> Result<(u32, u32)> {
@@ -192,6 +174,418 @@ fn scan_white_then_black(line: &[u8]) -> Result<(u32, u32)> {
     Ok((q, f))
 }
 
+// Streaming-friendly geometry inference from midlines only
+#[derive(Debug, Clone)]
+struct Midlines {
+    width: u32,
+    height: u32,
+    mid_row_luma: Vec<u8>, // len = width
+    mid_col_luma: Vec<u8>, // len = height
+}
+
+fn infer_geometry_from_midlines(m: &Midlines, threshold: u8) -> Result<Geometry> {
+    let w = m.width as usize;
+    let h = m.height as usize;
+    if w < 40 || h < 40 {
+        bail!("Image too small for frame/grid detection ({}×{})", w, h);
+    }
+
+    // Binarize midlines with given threshold
+    let mut row_bin = vec![0u8; w];
+    for i in 0..w { row_bin[i] = if m.mid_row_luma[i] > threshold { 255 } else { 0 }; }
+    let mut col_bin = vec![0u8; h];
+    for i in 0..h { col_bin[i] = if m.mid_col_luma[i] > threshold { 255 } else { 0 }; }
+
+    let (q_left, f_left) = scan_white_then_black(&row_bin)
+        .with_context(|| format!("Row probe (y={}): could not detect quiet+frame (threshold={})", h/2, threshold))?;
+    let (q_right, f_right) = {
+        let mut rev = row_bin.clone(); rev.reverse();
+        scan_white_then_black(&rev)
+            .with_context(|| format!("Row reverse probe (y={}): quiet+frame fail (threshold={})", h/2, threshold))?
+    };
+    let (q_top, f_top) = scan_white_then_black(&col_bin)
+        .with_context(|| format!("Column probe (x={}): quiet+frame fail (threshold={})", w/2, threshold))?;
+    let (q_bottom, f_bottom) = {
+        let mut rev = col_bin.clone(); rev.reverse();
+        scan_white_then_black(&rev)
+            .with_context(|| format!("Column reverse probe (x={}): quiet+frame fail (threshold={})", w/2, threshold))?
+    };
+
+    let cell_px_x = (f_left.min(f_right) / FRAME_CELLS).max(1);
+    let cell_px_y = (f_top.min(f_bottom) / FRAME_CELLS).max(1);
+    let cell_px = cell_px_x.min(cell_px_y).max(1);
+    let frame_px_quant = FRAME_CELLS * cell_px;
+
+    let origin_x = q_left + frame_px_quant;
+    let origin_y = q_top  + frame_px_quant;
+    let inner_right = (w as u32).saturating_sub(q_right + frame_px_quant);
+    let inner_bottom= (h as u32).saturating_sub(q_bottom + frame_px_quant);
+
+    if origin_x >= inner_right || origin_y >= inner_bottom {
+        bail!("Invalid frame bounds after quantization: origin=({}, {}), inner_right={}, inner_bottom={}",
+              origin_x, origin_y, inner_right, inner_bottom);
+    }
+
+    let grid_w_px = inner_right - origin_x;
+    let grid_h_px = inner_bottom - origin_y;
+    let grid_w = (grid_w_px / cell_px).max(1);
+    let grid_h = (grid_h_px / cell_px).max(1);
+
+    Ok(Geometry { cell_px, origin_x, origin_y, grid_w, grid_h, img_w: w as u32, img_h: h as u32 })
+}
+
+// ========================= PNG streaming helpers =========================
+
+fn luma_from_rgb(r: u8, g: u8, b: u8) -> u8 {
+    // Integer approx of 0.299R + 0.587G + 0.114B
+    let y = (77u16 * (r as u16) + 150u16 * (g as u16) + 29u16 * (b as u16) + 128) >> 8;
+    y as u8
+}
+
+fn pass_a_scan_midlines(path: &Path) -> Result<(Midlines, u8)> {
+    let file = fs::File::open(path).with_context(|| format!("open {:?}", path))?;
+    let mut dec = PngDecoder::new(file);
+    dec.set_transformations(PngXform::EXPAND | PngXform::STRIP_16);
+    let mut reader = dec.read_info().context("png read_info")?;
+    let info = reader.info();
+    let width = info.width;
+    let height = info.height;
+    if width == 0 || height == 0 { bail!("PNG has zero dimension"); }
+    let mid_y = height / 2;
+    let mid_x = width / 2;
+    let mut mid_row_luma = vec![0u8; width as usize];
+    let mut mid_col_luma = vec![0u8; height as usize];
+    let mut hist = [0u64; 256];
+
+    let ct = info.color_type;
+    match ct {
+        PngColorType::Grayscale | PngColorType::GrayscaleAlpha | PngColorType::Rgb | PngColorType::Rgba => {}
+        other => bail!("Unsupported PNG color type after EXPAND/STRIP16: {:?}", other),
+    };
+
+    for row_index in 0..height {
+        let row = reader.next_row()?.ok_or_else(|| anyhow!("png missing row {}", row_index))?;
+        let data = row.data();
+        // For histogram & mid row, compute luma for entire row once
+        for x in 0..(width as usize) {
+            let l = match ct {
+                PngColorType::Grayscale => data[x],
+                PngColorType::GrayscaleAlpha => data[x * 2],
+                PngColorType::Rgb => {
+                    let i = x * 3; luma_from_rgb(data[i], data[i+1], data[i+2])
+                }
+                PngColorType::Rgba => {
+                    let i = x * 4; luma_from_rgb(data[i], data[i+1], data[i+2])
+                }
+                _ => unreachable!(),
+            };
+            hist[l as usize] += 1;
+            if row_index == mid_y { mid_row_luma[x] = l; }
+        }
+        // Mid column sample
+        let mx = mid_x as usize;
+        let l = match ct {
+            PngColorType::Grayscale => data[mx],
+            PngColorType::GrayscaleAlpha => data[mx * 2],
+            PngColorType::Rgb => { let i = mx * 3; luma_from_rgb(data[i], data[i+1], data[i+2]) }
+            PngColorType::Rgba => { let i = mx * 4; luma_from_rgb(data[i], data[i+1], data[i+2]) }
+            _ => unreachable!(),
+        };
+        if (row_index as usize) < mid_col_luma.len() { mid_col_luma[row_index as usize] = l; }
+    }
+
+    // Otsu threshold from histogram
+    let mut total: u64 = 0; for v in hist { total += v; }
+    let mut sum: u64 = 0; for t in 0..256 { sum += (t as u64) * (hist[t] as u64); }
+    let mut sum_b = 0u64; let mut w_b = 0u64; let mut max = 0f64; let mut thr = 0u8;
+    for t in 0..256 {
+        w_b += hist[t] as u64; if w_b == 0 { continue; }
+        let w_f = total - w_b; if w_f == 0 { break; }
+        sum_b += (t as u64) * (hist[t] as u64);
+        let m_b = sum_b as f64 / w_b as f64;
+        let m_f = (sum - sum_b) as f64 / w_f as f64;
+        let var_b = (w_b as f64) * (w_f as f64) * (m_b - m_f).powi(2);
+        if var_b > max { max = var_b; thr = t as u8; }
+    }
+
+    Ok((Midlines { width, height, mid_row_luma, mid_col_luma }, thr))
+}
+
+// ========================= Streaming parser and consumers =========================
+
+enum Consumer<'a> {
+    #[cfg(test)]
+    Vec(Vec<u8>),
+    File(FileConsumer),
+    Compare(CompareConsumer<'a>),
+}
+
+struct FileConsumer {
+    base_png: PathBuf,
+    desired_name: Option<String>,
+    final_path: Option<PathBuf>,
+    out_path: Option<PathBuf>,
+    tmp_path: Option<PathBuf>,
+    file: Option<fs::File>,
+    skip_write: bool,
+}
+
+impl FileConsumer {
+    fn new(base_png: &Path) -> Self { Self { base_png: base_png.to_path_buf(), desired_name: None, final_path: None, out_path: None, tmp_path: None, file: None, skip_write: false } }
+}
+
+struct CompareConsumer<'a> { src: &'a [u8], pos: usize }
+
+struct StreamParser {
+    stage: ParserStage,
+    headers: Vec<Header>,
+    hdr_final: Option<Header>,
+    hasher: Hasher,
+    payload_remaining: u64,
+}
+
+enum ParserStage { Prefix { have: usize, buf: [u8; 6] }, HeaderLen { have: usize, buf: [u8;4], rep: usize }, HeaderBytes { have: usize, need: usize, buf: Vec<u8>, rep: usize }, Payload, Trailer { have: usize, buf: [u8;4] }, Done }
+
+impl StreamParser {
+    fn new() -> Self { Self { stage: ParserStage::Prefix { have: 0, buf: [0u8; 6] }, headers: Vec::with_capacity(HEADER_REPEAT), hdr_final: None, hasher: Hasher::new(), payload_remaining: 0 } }
+
+    fn on_header_ready<'a>(&mut self, cons: &mut Consumer<'a>) -> Result<()> {
+        let hdr = self.headers.last().cloned().unwrap();
+        match cons {
+            #[cfg(test)]
+            Consumer::Vec(_) => {}
+            Consumer::Compare(_) => {}
+            Consumer::File(fc) => {
+                let desired = if hdr.filename.trim().is_empty() { "decoded.bin".to_string() } else { hdr.filename.clone() };
+                fc.desired_name = Some(desired.clone());
+                let mut out_path = fc.base_png.with_file_name(&desired);
+                if out_path.exists() {
+                    let (h, l) = blake3_hash_file(&out_path)?;
+                    if l == hdr.total_len && h == hdr.file_hash {
+                        // Idempotent: skip writing; keep existing file
+                        fc.final_path = Some(out_path);
+                        fc.skip_write = true;
+                        return Ok(());
+                    } else {
+                        out_path = fc.base_png.with_file_name(format!("{}.restored", desired));
+                    }
+                }
+                let tmp = fc.base_png.with_file_name(format!("{}.restoring.tmp", desired));
+                let file = fs::File::create(&tmp).with_context(|| format!("create {:?}", tmp))?;
+                fc.final_path = Some(out_path.clone());
+                fc.out_path = Some(out_path);
+                fc.tmp_path = Some(tmp);
+                fc.file = Some(file);
+            }
+        }
+        Ok(())
+    }
+
+    fn feed<'a>(&mut self, mut data: &[u8], cons: &mut Consumer<'a>) -> Result<()> {
+        while !data.is_empty() {
+            match &mut self.stage {
+                ParserStage::Prefix { have, buf } => {
+                    let need = 6 - *have;
+                    let take = need.min(data.len());
+                    buf[*have..*have+take].copy_from_slice(&data[..take]);
+                    *have += take; data = &data[take..];
+                    if *have == 6 {
+                        if &buf[0..4] != MAGIC { bail!("Magic mismatch: got={:02x?}, expected={:02x?}", &buf[0..4], MAGIC); }
+                        let ver = u16::from_le_bytes([buf[4], buf[5]]);
+                        if ver != VERSION { bail!("Unsupported VERSION {} (expected {}).", ver, VERSION); }
+                        self.stage = ParserStage::HeaderLen { have: 0, buf: [0u8;4], rep: 0 };
+                    }
+                }
+                ParserStage::HeaderLen { have, buf, rep } => {
+                    let need = 4 - *have; let take = need.min(data.len());
+                    buf[*have..*have+take].copy_from_slice(&data[..take]);
+                    *have += take; data = &data[take..];
+                    if *have == 4 {
+                        let need = u32::from_le_bytes(*buf) as usize;
+                        self.stage = ParserStage::HeaderBytes { have: 0, need, buf: Vec::with_capacity(need), rep: *rep };
+                    }
+                }
+                ParserStage::HeaderBytes { have, need, buf, rep } => {
+                    let want = *need - *have; let take = want.min(data.len());
+                    buf.extend_from_slice(&data[..take]);
+                    *have += take; data = &data[take..];
+                    if *have == *need {
+                        let (hdr, rest) = postcard::take_from_bytes::<Header>(&buf).map_err(|e| anyhow!("Header[{}] postcard decode: {}", *rep, e))?;
+                        if !rest.is_empty() { bail!("Header[{}] trailing bytes ({})", *rep, rest.len()); }
+                        self.headers.push(hdr);
+                        if *rep + 1 < HEADER_REPEAT { self.stage = ParserStage::HeaderLen { have: 0, buf: [0u8;4], rep: *rep + 1 }; }
+                        else {
+                            if self.headers.windows(2).any(|w| w[0] != w[1]) { bail!("Header repeat mismatch: H0 != H1"); }
+                            let hdr = self.headers.last().cloned().unwrap();
+                            self.payload_remaining = hdr.payload_len;
+                            self.hdr_final = Some(hdr.clone());
+                            self.on_header_ready(cons)?;
+                            self.stage = ParserStage::Payload;
+                        }
+                    }
+                }
+                ParserStage::Payload => {
+                    if self.payload_remaining == 0 {
+                        self.stage = ParserStage::Trailer { have: 0, buf: [0u8;4] };
+                        continue;
+                    }
+                    let take = (self.payload_remaining as usize).min(data.len());
+                    let chunk = &data[..take];
+                    match cons {
+                        #[cfg(test)]
+                        Consumer::Vec(v) => v.extend_from_slice(chunk),
+                        Consumer::Compare(c) => {
+                            if c.pos + take > c.src.len() { bail!("Decoded payload longer than source slice"); }
+                            if &c.src[c.pos..c.pos+take] != chunk { bail!("Streamed bytes differ from source slice at {}", c.pos); }
+                            c.pos += take;
+                        }
+                        Consumer::File(fc) => { if let Some(f) = fc.file.as_mut() { std::io::Write::write_all(f, chunk)?; } }
+                    }
+                    self.hasher.update(chunk);
+                    self.payload_remaining -= take as u64;
+                    data = &data[take..];
+                }
+                ParserStage::Trailer { have, buf } => {
+                    let need = 4 - *have; let take = need.min(data.len());
+                    buf[*have..*have+take].copy_from_slice(&data[..take]);
+                    *have += take; data = &data[take..];
+                    if *have == 4 {
+                        let hdr = self.hdr_final.clone().unwrap();
+                        let trailer_u32 = u32::from_le_bytes(*buf);
+                        let got_hash = *self.hasher.finalize().as_bytes();
+                        if trailer_u32 != hdr.payload_hash32 { bail!("Trailer u32 mismatch: stream={:#010x}, header={:#010x}", trailer_u32, hdr.payload_hash32); }
+                        if got_hash != hdr.file_hash { bail!("BLAKE3 mismatch after streaming payload"); }
+                        if hdr.total_len != hdr.payload_len { bail!("Header total_len ({}) != payload_len ({})", hdr.total_len, hdr.payload_len); }
+                        self.stage = ParserStage::Done;
+                    }
+                }
+                ParserStage::Done => { return Ok(()); }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decode_streaming_with_consumer<'a>(path: &Path, geom: &Geometry, threshold: u8, mut consumer: Consumer<'a>) -> Result<Consumer<'a>> {
+    // Precompute lattice centers
+    let center_off = geom.cell_px / 2;
+    let mut centers_x: Vec<u32> = Vec::with_capacity(geom.grid_w as usize);
+    for c in 0..geom.grid_w { centers_x.push((geom.origin_x + c * geom.cell_px + center_off).min(geom.img_w - 1)); }
+    let mut centers_y: Vec<u32> = Vec::with_capacity(geom.grid_h as usize);
+    for r in 0..geom.grid_h { centers_y.push((geom.origin_y + r * geom.cell_px + center_off).min(geom.img_h - 1)); }
+
+    let file = fs::File::open(path).with_context(|| format!("open {:?}", path))?;
+    let mut dec = PngDecoder::new(file);
+    dec.set_transformations(PngXform::EXPAND | PngXform::STRIP_16);
+    let mut reader = dec.read_info().context("png read_info")?;
+    let info = reader.info();
+    let ct = info.color_type;
+
+    let mut parser = StreamParser::new();
+    // For File consumer, we must carry base path
+    if let Consumer::File(ref mut fc) = consumer { if fc.base_png.as_os_str().is_empty() { fc.base_png = path.to_path_buf(); } }
+
+    let mut next_row_idx = 0usize;
+    let mut bit_buf: u8 = 0; let mut bit_count: u8 = 0;
+    let mut out_bytes: Vec<u8> = Vec::with_capacity(1024);
+
+    for y in 0..geom.img_h {
+        let row = reader.next_row()?.ok_or_else(|| anyhow!("png missing row {}", y))?;
+        let data = row.data();
+        let target_y = if next_row_idx < centers_y.len() { centers_y[next_row_idx] } else { geom.img_h };
+        if y == target_y {
+            for &cx in &centers_x {
+                let mx = cx as usize;
+                let l = match ct {
+                    PngColorType::Grayscale => data[mx],
+                    PngColorType::GrayscaleAlpha => data[mx * 2],
+                    PngColorType::Rgb => { let i = mx * 3; luma_from_rgb(data[i], data[i+1], data[i+2]) }
+                    PngColorType::Rgba => { let i = mx * 4; luma_from_rgb(data[i], data[i+1], data[i+2]) }
+                    other => bail!("Unsupported PNG color type after EXPAND/STRIP16: {:?}", other),
+                };
+                let bit = if l <= threshold { 1u8 } else { 0u8 };
+                bit_buf |= bit << (7 - bit_count);
+                bit_count += 1;
+                if bit_count == 8 { out_bytes.push(bit_buf); bit_buf = 0; bit_count = 0; }
+            }
+            next_row_idx += 1;
+        }
+
+        // Feed any produced bytes to parser
+        if !out_bytes.is_empty() {
+            parser.feed(&out_bytes, &mut consumer)?;
+            out_bytes.clear();
+        }
+        if let ParserStage::Done = parser.stage { break; }
+    }
+
+    // Flush leftover partial byte (if any)
+    if bit_count > 0 { out_bytes.push(bit_buf); parser.feed(&out_bytes, &mut consumer)?; }
+
+    // If file consumer, finalize/rename/verify
+    match &mut consumer {
+        Consumer::File(fc) => {
+            if fc.skip_write {
+                // Nothing to rename; final_path already points to existing verified file
+            } else if let (Some(tmp), Some(out)) = (fc.tmp_path.take(), fc.out_path.take()) {
+                // Close file handle, then atomically move tmp -> out
+                drop(fc.file.take());
+                fs::rename(&tmp, &out).with_context(|| format!("rename {:?} -> {:?}", tmp, out))?;
+                let (reh, relen) = blake3_hash_file(&out)?;
+                let hdr = parser.hdr_final.ok_or_else(|| anyhow!("Missing header at finalize"))?;
+                if relen != hdr.total_len { bail!("Output length mismatch after write ({} vs {})", relen, hdr.total_len); }
+                if reh != hdr.file_hash { bail!("Output BLAKE3 mismatch after write"); }
+            }
+        }
+        _ => {}
+    }
+
+    if let ParserStage::Done = parser.stage { Ok(consumer) } else { bail!("Premature end of PNG rows before trailer") }
+}
+
+fn decode_png_to_file_streaming(path: &Path) -> Result<PathBuf> {
+    let (mid, otsu) = pass_a_scan_midlines(path)?;
+    let mut tries: Vec<u8> = vec![otsu];
+    tries.extend_from_slice(FALLBACK_THRESHOLDS);
+    let mut last_errs: Vec<anyhow::Error> = Vec::new();
+    for thr in tries {
+        match infer_geometry_from_midlines(&mid, thr)
+            .and_then(|geom| decode_streaming_with_consumer(path, &geom, thr, Consumer::File(FileConsumer::new(path)))) {
+            Ok(Consumer::File(fc)) => {
+                if let Some(final_path) = fc.final_path { return Ok(final_path); }
+                if let Some(out) = fc.out_path { return Ok(out); }
+                if let Some(name) = fc.desired_name { return Ok(path.with_file_name(name)); }
+                bail!("Decode completed but output path unknown");
+            }
+            Ok(_) => unreachable!(),
+            Err(e) => last_errs.push(e),
+        }
+    }
+    let mut msg = String::new(); use std::fmt::Write as _;
+    writeln!(&mut msg, "All threshold attempts failed for {:?}. Attempts: {}", path, last_errs.len()).ok();
+    for (i, e) in last_errs.iter().enumerate() { writeln!(&mut msg, "  [{}] {}", i, e).ok(); }
+    bail!(msg)
+}
+
+fn decode_png_compare_to_slice(path: &Path, original: &[u8]) -> Result<()> {
+    let (mid, otsu) = pass_a_scan_midlines(path)?;
+    let mut tries: Vec<u8> = vec![otsu];
+    tries.extend_from_slice(FALLBACK_THRESHOLDS);
+    let mut last_errs: Vec<anyhow::Error> = Vec::new();
+    for thr in tries {
+        match infer_geometry_from_midlines(&mid, thr)
+            .and_then(|geom| decode_streaming_with_consumer(path, &geom, thr, Consumer::Compare(CompareConsumer { src: original, pos: 0 }))) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_errs.push(e),
+        }
+    }
+    let mut msg = String::new(); use std::fmt::Write as _;
+    writeln!(&mut msg, "All threshold attempts failed for {:?}. Attempts: {}", path, last_errs.len()).ok();
+    for (i, e) in last_errs.iter().enumerate() { writeln!(&mut msg, "  [{}] {}", i, e).ok(); }
+    bail!(msg)
+}
+
+#[cfg(test)]
 fn try_infer_geometry(bin: &GrayImage, threshold: u8) -> Result<Geometry> {
     let w = bin.width() as usize;
     let h = bin.height() as usize;
@@ -243,24 +637,7 @@ fn try_infer_geometry(bin: &GrayImage, threshold: u8) -> Result<Geometry> {
     let grid_w = (grid_w_px / cell_px).max(1);
     let grid_h = (grid_h_px / cell_px).max(1);
 
-    Ok(Geometry {
-        threshold,
-        cell_px,
-        origin_x,
-        origin_y,
-        grid_w,
-        grid_h,
-        img_w: w as u32,
-        img_h: h as u32,
-        quiet_left: q_left,
-        frame_left_meas: f_left,
-        quiet_right: q_right,
-        frame_right_meas: f_right,
-        quiet_top: q_top,
-        frame_top_meas: f_top,
-        quiet_bottom: q_bottom,
-        frame_bottom_meas: f_bottom,
-    })
+    Ok(Geometry { cell_px, origin_x, origin_y, grid_w, grid_h, img_w: w as u32, img_h: h as u32 })
 }
 
 // ========================= Bit packing / unpacking =========================
@@ -272,6 +649,7 @@ fn bytes_to_bits(data: &[u8]) -> Vec<u8> {
     }
     bits
 }
+#[cfg(test)]
 fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; (bits.len() + 7) / 8];
     for (i, &bit) in bits.iter().enumerate() {
@@ -300,12 +678,12 @@ fn minimal_grid(bits_needed: usize) -> (u32, u32) {
     (w, h.max(1))
 }
 
-// Pick cell_px so final canvas <= MAX_SIDE_PX.
+// Pick cell_px targeting ~TARGET_SIDE_PX (best effort, not enforced).
 fn choose_cell_px_for_canvas(grid_w: u32, grid_h: u32) -> u32 {
     let total_cells_x = grid_w + 2 * (QUIET_CELLS + FRAME_CELLS);
     let total_cells_y = grid_h + 2 * (QUIET_CELLS + FRAME_CELLS);
     let max_cells_side = total_cells_x.max(total_cells_y).max(1);
-    let ideal = (MAX_SIDE_PX / max_cells_side).max(1);
+    let ideal = (TARGET_SIDE_PX / max_cells_side).max(1);
     let chosen = ideal.clamp(MIN_CELL_PX, MAX_CELL_PX);
     chosen.max(1)
 }
@@ -424,7 +802,7 @@ fn encode_file_to_png(input: &Path) -> Result<PathBuf> {
     let filename = input.file_name().and_then(OsStr::to_str).unwrap_or("unknown").to_string();
     let dataset_id = derive_dataset_id(&bytes, &filename);
 
-    // Size grid + header + cell_px with canvas cap.
+    // Size grid + header + cell_px with canvas sizing (best-effort target).
     let (header, hdr_bytes, overhead, cell_px) = choose_grid_and_header(&filename, &bytes, dataset_id)?;
     let needed_bits = (overhead + bytes.len()) * 8;
     let cap_bits = (header.grid_w as usize) * (header.grid_h as usize);
@@ -454,11 +832,9 @@ fn encode_file_to_png(input: &Path) -> Result<PathBuf> {
     DynamicImage::ImageRgba8(img).save(&out).context("write png")?;
     ok!("PNG written.");
 
-    // Active proof: re-open and decode
-    step!("Re-opening PNG for verification…");
-    let decoded = decode_png_to_bytes(&out)?;
-    let verified = verify_bytes(header.total_len, header.file_hash, UnverifiedBytes(decoded))?;
-    if verified.as_slice() != bytes.as_slice() { bail!("Post-write byte-for-byte comparison failed"); }
+    // Active proof: re-open and streaming-verify decode
+    step!("Re-opening PNG for streaming verification…");
+    decode_png_compare_to_slice(&out, &bytes)?;
     ok!("Round-trip verification OK (length + BLAKE3 + exact bytes).");
 
     eprintln!();
@@ -468,150 +844,27 @@ fn encode_file_to_png(input: &Path) -> Result<PathBuf> {
 
 // ========================= Decode =========================
 
+#[cfg(test)]
 fn decode_png_to_bytes(path: &Path) -> Result<Vec<u8>> {
-    let dynimg = image::open(path).with_context(|| format!("open {:?}", path))?;
-    let gray0 = dynimg.to_luma8();
-
-    let otsu = otsu_threshold(&gray0);
+    let (mid, otsu) = pass_a_scan_midlines(path)?;
     let mut tries: Vec<u8> = vec![otsu];
     tries.extend_from_slice(FALLBACK_THRESHOLDS);
-
     let mut last_errs: Vec<anyhow::Error> = Vec::new();
-
     for thr in tries {
-        let bin = binarize(&gray0, thr);
-        match decode_from_binary_image_with_threshold(&bin, thr) {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                last_errs.push(e);
-                continue;
-            }
+        match infer_geometry_from_midlines(&mid, thr)
+            .and_then(|geom| decode_streaming_with_consumer(path, &geom, thr, Consumer::Vec(Vec::new()))) {
+            Ok(Consumer::Vec(v)) => return Ok(v),
+            Ok(_) => unreachable!(),
+            Err(e) => last_errs.push(e),
         }
     }
-
-    // Surface the richest error with context
-    let mut msg = String::new();
-    use std::fmt::Write;
+    let mut msg = String::new(); use std::fmt::Write as _;
     writeln!(&mut msg, "All threshold attempts failed for {:?}. Attempts: {}", path, last_errs.len()).ok();
-    for (i, e) in last_errs.iter().enumerate() {
-        writeln!(&mut msg, "  [{}] {}", i, e).ok();
-    }
-    bail!(msg);
+    for (i, e) in last_errs.iter().enumerate() { writeln!(&mut msg, "  [{}] {}", i, e).ok(); }
+    bail!(msg)
 }
 
-fn decode_from_binary_image_with_threshold(bin: &GrayImage, threshold: u8) -> Result<Vec<u8>> {
-    let geom = try_infer_geometry(bin, threshold)
-        .with_context(|| format!(
-            "Geometry inference failed @threshold {} (img={}×{}). \
-             EXPECTED: quiet={} cells, frame={} cells. \
-             HINT: Ensure frame is intact, no excessive cropping.",
-            threshold, bin.width(), bin.height(), QUIET_CELLS, FRAME_CELLS
-        ))?;
-
-    // Sample the *center* pixel of each cell (quantized origin ensures lattice alignment)
-    let center_off = geom.cell_px / 2;
-    let raw = bin.as_raw();
-    let w = bin.width() as usize;
-
-    let mut bits = Vec::with_capacity((geom.grid_w * geom.grid_h) as usize);
-    for r in 0..geom.grid_h {
-        for c in 0..geom.grid_w {
-            let cx = (geom.origin_x + c * geom.cell_px + center_off).min(bin.width() - 1) as usize;
-            let cy = (geom.origin_y + r * geom.cell_px + center_off).min(bin.height() - 1) as usize;
-            let v = raw[cy * w + cx];
-            bits.push(if v < 128 { 1 } else { 0 });
-        }
-    }
-    let stream = bits_to_bytes(&bits);
-
-    // Parse stream with precise diagnostics.
-    if stream.len() < 6 {
-        bail!(
-            "Stream too short ({} bytes) for MAGIC+VERSION. \
-             geom={{thr:{}, cell_px:{}, origin:({}, {}), grid:{}×{}, img:{}×{}, qlf:{}, flm:{}, qrt:{}, frm:{}, qtp:{}, ftm:{}, qbm:{}, fbm:{}}}",
-            stream.len(), geom.threshold, geom.cell_px, geom.origin_x, geom.origin_y,
-            geom.grid_w, geom.grid_h, geom.img_w, geom.img_h,
-            geom.quiet_left, geom.frame_left_meas, geom.quiet_right, geom.frame_right_meas,
-            geom.quiet_top, geom.frame_top_meas, geom.quiet_bottom, geom.frame_bottom_meas
-        );
-    }
-    if &stream[0..4] != MAGIC {
-        bail!(
-            "Magic mismatch: got={:02x?}, expected={:02x?}. \
-             geom={{thr:{}, cell_px:{}, origin:({}, {}), grid:{}×{}, img:{}×{}}}",
-            &stream[0..4], MAGIC, geom.threshold, geom.cell_px, geom.origin_x, geom.origin_y,
-            geom.grid_w, geom.grid_h, geom.img_w, geom.img_h
-        );
-    }
-    let ver = u16::from_le_bytes([stream[4], stream[5]]);
-    if ver != VERSION {
-        bail!("Unsupported VERSION {} (expected {}).", ver, VERSION);
-    }
-
-    let mut cursor = 6usize;
-    let mut headers: Vec<Header> = Vec::with_capacity(HEADER_REPEAT);
-    for i in 0..HEADER_REPEAT {
-        if cursor + 4 > stream.len() {
-            bail!("Header[{}] length u32 missing at cursor {} / {}.", i, cursor, stream.len());
-        }
-        let len = u32::from_le_bytes([stream[cursor], stream[cursor+1], stream[cursor+2], stream[cursor+3]]) as usize;
-        cursor += 4;
-        if cursor + len > stream.len() {
-            bail!("Header[{}] bytes truncated: want {} at {}, have {}.", i, len, cursor, stream.len() - cursor);
-        }
-        let (h, rest) = postcard::take_from_bytes::<Header>(&stream[cursor..cursor+len])
-            .map_err(|e| anyhow!("Header[{}] postcard decode failed at {}..{}: {}", i, cursor, cursor+len, e))?;
-        if !rest.is_empty() {
-            bail!("Header[{}] trailing bytes ({}).", i, rest.len());
-        }
-        headers.push(h);
-        cursor += len;
-    }
-    if headers.windows(2).any(|w| w[0] != w[1]) {
-        bail!("Header repeat mismatch: H0 != H1. H0={:?}, H1={:?}", headers[0], headers[1]);
-    }
-    let hdr = headers.pop().unwrap();
-
-    // Optional: cross-check grid sizes (advisory)
-    if hdr.grid_w != geom.grid_w || hdr.grid_h != geom.grid_h {
-        warn!("Grid advisory mismatch (header {}×{} vs inferred {}×{}). Proceeding.",
-              hdr.grid_w, hdr.grid_h, geom.grid_w, geom.grid_h);
-    }
-
-    // Payload + trailer
-    let payload_start = cursor;
-    let payload_len = hdr.payload_len as usize;
-    if payload_start + payload_len + 4 > stream.len() {
-        bail!(
-            "Payload/trailer out of bounds: start={}, len={}, stream_len={}",
-            payload_start, payload_len, stream.len()
-        );
-    }
-    let payload = &stream[payload_start..payload_start + payload_len];
-    let trailer = &stream[payload_start + payload_len .. payload_start + payload_len + 4];
-    let trailer_u32 = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    let got32 = hash32_first(payload);
-
-    if trailer_u32 != hdr.payload_hash32 {
-        bail!(
-            "Trailer u32 mismatch: stream={:#010x}, header={:#010x}. Payload_len={}, BLAKE3(first4)={:#010x}.",
-            trailer_u32, hdr.payload_hash32, payload_len, got32
-        );
-    }
-    if blake3_hash_bytes(payload) != hdr.file_hash {
-        bail!(
-            "Assembled payload BLAKE3 mismatch. expected={}, got={}",
-            hex32(hdr.file_hash), hex32(blake3_hash_bytes(payload))
-        );
-    }
-    if hdr.total_len != hdr.payload_len {
-        bail!(
-            "Header total_len ({}) != payload_len ({}).", hdr.total_len, hdr.payload_len
-        );
-    }
-
-    Ok(payload.to_vec())
-}
+// (removed legacy full-frame decode function; streaming path is used exclusively)
 
 // ========================= One-arg entry =========================
 
@@ -644,66 +897,10 @@ fn real_main() -> Result<()> {
     if !path.exists() { bail!("Path does not exist: {:?}", path); }
 
     if is_png(&path) {
-        // DECODE → write original file (idempotent, no overwrite unless content differs)
-        step!("Decoding PNG {:?} → original file…", path.file_name().unwrap_or_default());
-        let bytes = decode_png_to_bytes(&path)?;
-
-        // Decode header again quickly to get filename (reuse same path decode to parse headers)
-        let dynimg = image::open(&path)?;
-        let gray = dynimg.to_luma8();
-        let thr = otsu_threshold(&gray);
-        let bin = binarize(&gray, thr);
-        let geom = try_infer_geometry(&bin, thr)?;
-        // sample again to get the stream and just parse headers (cheap)
-        let center_off = geom.cell_px / 2;
-        let raw = bin.as_raw();
-        let w = bin.width() as usize;
-        let mut bits = Vec::with_capacity((geom.grid_w * geom.grid_h) as usize);
-        for r in 0..geom.grid_h {
-            for c in 0..geom.grid_w {
-                let cx = (geom.origin_x + c * geom.cell_px + center_off).min(bin.width() - 1) as usize;
-                let cy = (geom.origin_y + r * geom.cell_px + center_off).min(bin.height() - 1) as usize;
-                bits.push(if raw[cy * w + cx] < 128 { 1 } else { 0 });
-            }
-        }
-        let stream = bits_to_bytes(&bits);
-        if &stream[0..4] != MAGIC { bail!("Magic mismatch while extracting filename"); }
-        let mut cursor = 6usize;
-        let mut hdr_opt: Option<Header> = None;
-        for _ in 0..HEADER_REPEAT {
-            let len = u32::from_le_bytes([stream[cursor], stream[cursor+1], stream[cursor+2], stream[cursor+3]]) as usize;
-            cursor += 4;
-            let (hdr, _rest) = postcard::take_from_bytes::<Header>(&stream[cursor..cursor+len])?;
-            cursor += len;
-            hdr_opt = Some(hdr);
-        }
-        let hdr = hdr_opt.ok_or_else(|| anyhow!("Header missing after repeats"))?;
-
-        let desired_name = if hdr.filename.trim().is_empty() { "decoded.bin".to_string() } else { hdr.filename.clone() };
-        let mut out_path = path.with_file_name(&desired_name);
-
-        if out_path.exists() {
-            let (h, l) = blake3_hash_file(&out_path)?;
-            if l == hdr.total_len && h == hdr.file_hash {
-                ok!("Existing file matches payload; nothing to write.");
-                eprintln!();
-                ok!("DECODE COMPLETE → {:?}", out_path.file_name().unwrap_or_default());
-                return Ok(());
-            }
-            warn!("{:?} exists with different content; appending .restored", out_path.file_name().unwrap_or_default());
-            out_path = path.with_file_name(format!("{}.restored", desired_name));
-        }
-
-        step!("Writing reconstructed file to {:?}…", out_path.file_name().unwrap_or_default());
-        fs::write(&out_path, &bytes).with_context(|| format!("write {:?}", out_path))?;
-        ok!("File written.");
-
-        step!("Re-reading written file to re-verify…");
-        let (reh, relen) = blake3_hash_file(&out_path)?;
-        if relen != hdr.total_len { bail!("Output length mismatch after write ({} vs {})", relen, hdr.total_len); }
-        if reh != hdr.file_hash { bail!("Output BLAKE3 mismatch after write"); }
-        ok!("Output verified (length + BLAKE3).");
-
+        // DECODE → write original file (idempotent, streaming, one PNG in/one file out)
+        step!("Decoding PNG {:?} → original file (streaming)…", path.file_name().unwrap_or_default());
+        let out_path = decode_png_to_file_streaming(&path)?;
+        ok!("Output verified (length + BLAKE3): {:?}", out_path.file_name().unwrap_or_default());
         eprintln!();
         ok!("DECODE COMPLETE → {:?}", out_path.file_name().unwrap_or_default());
     } else {
@@ -943,6 +1140,34 @@ mod tests {
         let decoded = super::decode_png_to_bytes(&out_png)?;
         assert_eq!(blake3_hash_bytes(&data), blake3_hash_bytes(&decoded));
         assert_eq!(data, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_2mb_text_streaming_to_file() -> Result<()> {
+        let dir = tempdir()?;
+        let input = dir.path().join("big.txt");
+        let size = 2 * 1024 * 1024; // 2 MiB
+        let mut content = Vec::with_capacity(size);
+        // Fill with deterministic ASCII pattern
+        while content.len() < size {
+            let line = b"The quick brown fox jumps over the lazy dog.\n";
+            let take = (size - content.len()).min(line.len());
+            content.extend_from_slice(&line[..take]);
+        }
+        fs::write(&input, &content)?;
+
+        // Encode
+        let out_png = super::encode_file_to_png(&input)?;
+
+        // Streaming decode to file
+        let out_file = super::decode_png_to_file_streaming(&out_png)?;
+
+        // Verify
+        let decoded = fs::read(&out_file)?;
+        assert_eq!(decoded.len(), content.len());
+        assert_eq!(blake3_hash_bytes(&decoded), blake3_hash_bytes(&content));
+        assert_eq!(decoded, content);
         Ok(())
     }
 }

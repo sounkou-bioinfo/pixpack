@@ -7,8 +7,8 @@ Authors@R: c(
     person("Sounkou Mahamane", "Toure", role = c("aut", "cre"),
            email = "sounkoutoure@gmail.com",
            comment = "Package maintainer and R bindings"),
-    person("Claude", "Sonnet", role = "ctb",
-           comment = "R bindings implementation assistance")
+    person("Claude", "Opus", role = "ctb",
+           comment = "For R bindings implementation assistance")
     )
 Description: R bindings for PixPack, a utility that encodes arbitrary files and 
     strings into PNG images with strong integrity checks using BLAKE3 hashing.

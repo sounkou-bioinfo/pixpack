@@ -4,11 +4,12 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use blake3::Hasher;
-use image::{DynamicImage, GrayImage, ImageBuffer, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, ImageBuffer, Rgba, RgbaImage, RgbImage};
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, fs, io::Read, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
 use savvy::savvy;
 use savvy::{NotAvailableValue, OwnedStringSexp, StringSexp};
+use png::{Decoder as PngDecoder, ColorType as PngColorType};
 
 // ---------------- Configuration ----------------
 const MAGIC: &[u8; 4] = b"PXPV"; // PixPack Visual v1
@@ -142,8 +143,39 @@ fn encode_file_to_png(input:&Path) -> Result<PathBuf> {
 }
 
 // ---------------- Decode ----------------
+fn open_to_gray(path: &Path) -> Result<GrayImage> {
+    match image::open(path) {
+        Ok(d) => Ok(d.to_luma8()),
+        Err(_) => {
+            let file = fs::File::open(path)?;
+            let decoder = PngDecoder::new(file);
+            let mut reader = decoder.read_info().context("png read_info failed")?;
+            let mut buf = vec![0u8; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).context("png next_frame failed")?;
+            let w = info.width;
+            let h = info.height;
+            let size = info.buffer_size();
+            let data = &buf[..size];
+            match info.color_type {
+                PngColorType::Grayscale => {
+                    GrayImage::from_vec(w, h, data.to_vec()).ok_or_else(|| anyhow!("invalid grayscale buffer"))
+                }
+                PngColorType::Rgb => {
+                    let img = RgbImage::from_raw(w, h, data.to_vec()).ok_or_else(|| anyhow!("invalid rgb buffer"))?;
+                    Ok(DynamicImage::ImageRgb8(img).to_luma8())
+                }
+                PngColorType::Rgba => {
+                    let img = RgbaImage::from_raw(w, h, data.to_vec()).ok_or_else(|| anyhow!("invalid rgba buffer"))?;
+                    Ok(DynamicImage::ImageRgba8(img).to_luma8())
+                }
+                _ => bail!("unsupported PNG color type"),
+            }
+        }
+    }
+}
+
 fn decode_png_to_bytes(path:&Path) -> Result<Vec<u8>> {
-    let dynimg=image::open(path).with_context(|| format!("open {:?}", path))?; let gray0 = dynimg.to_luma8();
+    let gray0 = open_to_gray(path).with_context(|| format!("open {:?}", path))?;
     let otsu = otsu_threshold(&gray0); let mut tries: Vec<u8> = vec![otsu]; tries.extend_from_slice(FALLBACK_THRESHOLDS); let mut last_errs: Vec<anyhow::Error>=Vec::new();
     for thr in tries { let bin = binarize(&gray0, thr); match decode_from_binary_image_with_threshold(&bin, thr) { Ok(bytes)=> return Ok(bytes), Err(e)=> { last_errs.push(e); continue; } } }
     let mut msg=String::new(); use std::fmt::Write; writeln!(&mut msg, "All threshold attempts failed for {:?}. Attempts: {}", path, last_errs.len()).ok(); for (i,e) in last_errs.iter().enumerate(){ writeln!(&mut msg, "  [{}] {}", i, e).ok(); } bail!(msg)

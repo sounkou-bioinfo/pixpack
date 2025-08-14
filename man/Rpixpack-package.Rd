@@ -11,11 +11,16 @@ arbitrary files and strings into PNG images and decode them back to their
 original form.
 }
 \author{
-\strong{Maintainer}: Claude Sonnet \email{claude@anthropic.com} (R bindings implementation)
+\strong{Maintainer}: Sounkou Mahamane Toure \email{sounkoutoure@gmail.com} (Package maintainer and R bindings)
 
 Authors:
 \itemize{
   \item SauersML (Original PixPack author)
+}
+
+Other contributors:
+\itemize{
+  \item Claude Opus (For R bindings implementation assistance) [contributor]
 }
 
 }

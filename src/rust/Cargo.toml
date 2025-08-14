@@ -13,6 +13,7 @@ blake3 = "1.8"
 image = "0.25"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
+png = "0.17"
 
 [profile.release]
 # By default, on release build, savvy terminates the R session when a panic

@@ -867,6 +867,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "image",
+ "png",
  "postcard",
  "savvy",
  "serde",
