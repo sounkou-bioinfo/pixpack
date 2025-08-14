@@ -1,8 +1,8 @@
 # Workflow derived from https://github.com/sounkou-bioinfo/goServeR/blob/main/.github/workflows/r.yml
 
 on:
-  #push:
-  #  branches: [main]
+  push:
+    branches: [main]
   #pull_request:
   workflow_dispatch:
 
